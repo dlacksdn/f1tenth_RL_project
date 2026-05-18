@@ -19,3 +19,6 @@ challengeproject.tar.gz
 
 # Windows metadata
 *:Zone.Identifier
+
+# OMC local state
+.omc/

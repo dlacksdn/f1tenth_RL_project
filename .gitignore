@@ -16,3 +16,6 @@ challengeproject.tar
 challengeproject.tar.gz
 .idea/
 .riders-token
+
+# Windows metadata
+*:Zone.Identifier

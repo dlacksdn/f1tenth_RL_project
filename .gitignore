@@ -24,3 +24,37 @@ challengeproject.tar.gz
 
 # OMC local state
 .omc/
+
+# ─────────────────────────────────────────────────────────────
+# 학습 산출물 (머신별, 대용량, 재학습 가능)
+# 집컴(GPU)에서만 생성. 노트북(CPU)으로 동기화 불필요.
+# ─────────────────────────────────────────────────────────────
+logs/
+runs/
+checkpoints/
+*.pt
+*.ckpt
+wandb/
+events.out.tfevents.*
+tb_logs/
+
+# Replay buffer (1.5~2GB, fp16 200K step)
+replay/
+*.npz
+
+# 학습 임시 출력
+*.log
+!_thinking/**/*.log
+
+# ─────────────────────────────────────────────────────────────
+# 동기화 대상 (참고용 명시 — 실제로는 ignore 규칙 없음)
+# ─────────────────────────────────────────────────────────────
+# scripts/                     ← 코드, commit
+# dreamer_f1tenth/             ← Phase 1-2+ 신규 코드, commit
+# gym/f110_gym/                ← in-place 패치, commit
+# pkg/                         ← 기존 코드, commit
+# maps/*.csv                   ← centerline 산출물, 재추출 비용 → commit
+# _thinking/                   ← 작업 trail, 양 머신 세션이 봐야 함 → commit
+# _thinking/notes/             ← 측정 결과, 재측정 비용 → commit
+#
+# /home/dlacksdn/dreamerv3-torch/  ← 외부 디렉토리, 본 repo 무관. 별도 동기화.

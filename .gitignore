@@ -13,6 +13,7 @@ docs/_build/
 .env
 venv/**/*
 env/
+.venv/
 challengeproject.tar
 challengeproject.tar.gz
 .idea/

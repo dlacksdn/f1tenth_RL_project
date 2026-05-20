@@ -485,7 +485,7 @@ class Simulator(object):
             observations['poses_y'].append(agent.state[1])
             observations['poses_theta'].append(agent.state[4])
             observations['linear_vels_x'].append(agent.state[3])
-            observations['linear_vels_y'].append(0.)
+            observations['linear_vels_y'].append(agent.state[3] * np.sin(agent.state[6]))
             observations['ang_vels_z'].append(agent.state[5])
 
         return observations

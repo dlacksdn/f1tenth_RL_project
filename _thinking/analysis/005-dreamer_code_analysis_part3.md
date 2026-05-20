@@ -1,569 +1,547 @@
-# 005 - Dreamer-v3 코드 분석 (Part 3: ImagBehavior 세부 + 분포 head)
+# 005 - Dreamer-v3 코드 분석 (Part 3: WorldModel + RewardEMA + ImagBehavior 통합)
 
+> **Revision**: 2026-05-20 — 4차원 진정성 감사 결과 직접 반영. 003 §2(WorldModel·ImagBehavior 개요) 본문을 본 문서로 흡수, RewardEMA를 단일 위치(§2)로 통합, 분포 카탈로그를 [004 §1](004-dreamer_code_analysis_part2.md#1-분포-카탈로그-toolspy)로 이전, λ-return 출력 shape 오류 정정, 누락 항목(video_pred, reward/cont outscale 차이, Optimizer 본체) 보강. 변경 내역은 [008](008-audit-changelog.md) 참조.
 > **목적**: `NM512/dreamerv3-torch` 코드 자체 이해. F1TENTH 통합 설계가 아니라 **알고리즘 코드 자체** 분석.
-> **선행 문서**:
-> - [003-dreamer_code_analysis_part1.md](003-dreamer_code_analysis_part1.md) — 진입점·WorldModel·ImagBehavior 개요
-> - [004-dreamer_code_analysis_part2.md](004-dreamer_code_analysis_part2.md) — RSSM·Encoder/Decoder
-> **분석 대상**: `/home/dlacksdn/dreamerv3-torch/models.py`, `tools.py`
-> **작성일**: 2026-05-20
+> **선행 문서**: [003](003-dreamer_code_analysis_part1.md) 진입점·Config, [004](004-dreamer_code_analysis_part2.md) 분포·RSSM·Encoder/Decoder.
+> **분석 대상**: `/home/dlacksdn/dreamerv3-torch/models.py`, 부분 `tools.py`.
+> **인용 규약**: 줄 링크 `(파일#L<a>-L<b>)`만. 코드 블록 발췌 없음.
 
 ---
 
-## 0. 다음 세션 핸드오프 (READ FIRST)
+## 0. 핸드오프
 
 ### 현재까지 진행 상태
-- ✅ 1단계: 진입점 + Config (`dreamer.py`, `configs.yaml`) — 003 문서
-- ✅ 2단계: WorldModel + ImagBehavior 개요 (`models.py`) — 003 문서
-- ✅ 3단계: RSSM 동역학 (`networks.py`의 `RSSM`) — 004 §1
-- ✅ 4단계: Encoder/Decoder (`networks.py`) — 004 §2
-- ✅ 5단계: **ImagBehavior 세부** — λ-return, RewardEMA, slow target self-distill, advantage 정규화 — **이 문서 §1**
-- ✅ 6단계: **Heads & 분포** — `SymlogDist`/`DiscDist`/`OneHotDist`/twohot — **이 문서 §2**
-- ⏭️ **7단계 (NEXT)**: Exploration — `exploration.py`의 `Plan2Explore`, `Random`. WorldModel의 disagreement ensemble이 어떻게 imagination reward로 들어가는지.
+- ✅ 1단계 진입점·Config — [003](003-dreamer_code_analysis_part1.md)
+- ✅ 2단계 분포 카탈로그 — [004 §1](004-dreamer_code_analysis_part2.md#1-분포-카탈로그-toolspy)
+- ✅ 3단계 RSSM — [004 §2](004-dreamer_code_analysis_part2.md#2-rssm-동역학-networkspy의-rssm)
+- ✅ 4단계 Encoder/Decoder — [004 §3](004-dreamer_code_analysis_part2.md#3-encoderdecoder-networkspy)
+- ✅ 5단계 **WorldModel** — 본 문서 §1
+- ✅ **RewardEMA** — 본 문서 §2
+- ✅ 6단계 **ImagBehavior** — 본 문서 §3
+- ✅ **Optimizer 래퍼** — 본 문서 §4
+- ✅ **손실 흐름 한눈에** — 본 문서 §5
+- ⏭️ **다음**: [006](006-dreamer_code_analysis_part4.md) — Exploration + 데이터 + 포팅 + 평가
 
-### 전체 로드맵 (003에서 정의, 변경 없음)
-1. ✅ 진입점·실행 흐름 (`dreamer.py`)
-2. ✅ WorldModel (`models.py`)
-3. ✅ RSSM 동역학 (`networks.py`의 `RSSM`)
-4. ✅ Encoder/Decoder (`networks.py`)
-5. ✅ ImagBehavior 세부
-6. ✅ Heads & 분포
-7. ⏭️ **Exploration** (`exploration.py`) — `Plan2Explore`, `Random`
-8. 데이터 파이프라인 (`tools.py`의 `load_episodes`/`sample_episodes`/`from_generator`/`simulate`)
-9. 유틸: Optimizer 래퍼(✅ §1-9에서 다룸), EMA(✅ §1-1, §1-2), slow target(✅ §1-2), gradient clipping(✅ §1-9)
-- **제외**: `envs/`, `parallel.py`, `Dockerfile`, `requirements.txt`
-
-### 파일 위치
-```
-/home/dlacksdn/dreamerv3-torch/
-├── dreamer.py         365 lines  (✅ 003)
-├── models.py          441 lines  (✅ 003 + 005 §1)
-├── networks.py        810 lines  (✅ 003 + 004)
-├── tools.py          1000 lines  (✅ 005 §1-§2 부분, 8단계에서 데이터 파이프라인)
-├── exploration.py     135 lines  (⏭️ 7단계)
-├── parallel.py        209 lines  (제외)
-├── configs.yaml       184 lines  (✅ 003)
-└── envs/                         (제외)
-```
-
-### 사용자 작업 컨벤션 (반드시 지킬 것)
-- `_thinking/analysis/`는 **append-only**. 기존 파일 절대 수정 금지.
-- 새 파일은 명시적 요청("N 문서로 저장")이 있을 때만 저장.
-- 파일 이름은 `NNN-dreamer_code_analysis_partK.md` 형식 (003·004와 통일).
-- **한글로 응답**.
-- 코드 인용은 markdown link `[파일:라인](../../../dreamerv3-torch/파일#L라인)` 형식.
-- 분석은 **dreamer-v3 코드 자체 이해**가 목적. F1TENTH 통합 얘기 섞지 말 것.
-- 사용자 메시지 "진행해" = 다음 단계 진행 신호.
-
-### 다음 에이전트 진입 명령 (그대로 사용)
-> "`_thinking/analysis/005-dreamer_code_analysis_part3.md`의 핸드오프 섹션을 보고 7단계(Exploration)로 진행해. `/home/dlacksdn/dreamerv3-torch/exploration.py`의 `Plan2Explore`(ensemble disagreement 보너스, one_step head 학습 흐름)와 `Random`(랜덤 베이스라인)을 코드 레벨로 정리하고, `dreamer.py`에서 `_expl_behavior`가 언제 호출되는지(`expl_behavior` config 분기, `expl_amount`/`expl_until`/`expl_decay` 스케줄)도 확인해. 결과 보고 후 사용자에게 저장 요청 받기를 기다려. 저장 파일명은 `006-dreamer_code_analysis_part4.md`."
+### 컨벤션
+- 한국어 응답.
+- 코드 인용은 줄 링크만. 코드 블록 발췌 금지.
+- 분석 대상은 **dreamer-v3 코드 자체**. F1TENTH 통합 코멘트 금지.
+- 본 감사 작업 한정으로 003~006 직접 수정 허용.
 
 ---
 
-## 1. ImagBehavior 세부 (`models.py` + `tools.py`)
+## 1. WorldModel (`models.py`)
 
-### 1-0. 함수 호출 그래프
-```
-ImagBehavior._train(start, objective)            # models.py:290
-├── _update_slow_target()                         # polyak EMA
-├── _imagine(start, actor, H=15)                  # imagination rollout
-│   └── tools.static_scan(step, range(H), ...)
-├── reward = objective(feat, state, action)       # 외부 주입 람다
-├── _compute_target(feat, state, reward)
-│   ├── cont_head(feat).mean                      # γ = discount · P(continue)
-│   ├── value(feat).mode()
-│   └── tools.lambda_return(...)
-│       └── tools.static_scan_for_lambda_return   # 역방향 스캔
-├── _compute_actor_loss(feat, action, target, weights, base)
-│   └── self.reward_ema(target, ema_vals)         # 5/95 quantile EMA
-├── value loss (slow_value self-distill 포함)
-└── _actor_opt(...) + _value_opt(...)             # AMP, clip, decoupled WD
-```
+위치: [models.py:29-215](../../../dreamerv3-torch/models.py#L29-L215). encoder, RSSM dynamics, 3개 head를 묶은 nn.Module. 단일 옵티마이저 `_model_opt`로 전체 학습.
 
-### 1-1. `RewardEMA` — 5/95 quantile EMA ([models.py:11-26](../../../dreamerv3-torch/models.py#L11-L26))
+### 1-1. `__init__` — 구성요소 조립 ([models.py:30-106](../../../dreamerv3-torch/models.py#L30-L106))
 
-```python
-def __init__(self, device, alpha=1e-2):
-    self.range = torch.tensor([0.05, 0.95], device=device)
+| 컴포넌트 | 위치 | 역할 | 출력 shape |
+|---|---|---|---|
+| `encoder = MultiEncoder(shapes, **config.encoder)` | [L36](../../../dreamerv3-torch/models.py#L36) | obs(dict) → embed | `[B, T, embed_size]` |
+| `embed_size = self.encoder.outdim` | [L37](../../../dreamerv3-torch/models.py#L37) | RSSM 입력 차원 결정 | — |
+| `dynamics = RSSM(stoch, deter, hidden, ...)` | [L38-54](../../../dreamerv3-torch/models.py#L38-L54) | embed + action → latent state | `{stoch, deter, logit/mean/std, ...}` |
+| `heads['decoder'] = MultiDecoder(feat_size, shapes, **config.decoder)` | [L60-62](../../../dreamerv3-torch/models.py#L60-L62) | feat → obs 재구성 분포(dict) | 키별 분포 |
+| `heads['reward'] = MLP(feat_size, (255,), 2 layers, dist='symlog_disc', outscale=0.0)` | [L63-74](../../../dreamerv3-torch/models.py#L63-L74) | feat → reward 분포 | 255-bin DiscDist |
+| `heads['cont'] = MLP(feat_size, (), 2 layers, dist='binary', outscale=1.0)` | [L75-86](../../../dreamerv3-torch/models.py#L75-L86) | feat → continue 확률 | Bernoulli |
 
-def __call__(self, x, ema_vals):
-    flat_x = torch.flatten(x.detach())                       # ① target을 1D로
-    x_quantile = torch.quantile(flat_x, q=self.range)        # ② 현재 batch의 5%, 95% quantile
-    ema_vals[:] = self.alpha * x_quantile + (1 - self.alpha) * ema_vals   # ③ in-place EMA
-    scale = torch.clip(ema_vals[1] - ema_vals[0], min=1.0)   # ④ 5~95 range = scale (하한 1.0)
-    offset = ema_vals[0]
-    return offset.detach(), scale.detach()
-```
+**feat_size 계산** ([L56-59](../../../dreamerv3-torch/models.py#L56-L59)):
+- discrete RSSM: `dyn_stoch · dyn_discrete + dyn_deter = 32·32 + 512 = 1536`.
+- continuous RSSM: `dyn_stoch + dyn_deter = 32 + 512 = 544`.
 
-핵심:
-- `alpha=1e-2` → 매 actor 업데이트마다 1%만 새 값 반영, 99% 과거 보존. 매우 느린 EMA.
-- `ema_vals`는 `nn.Module`의 buffer로 등록 ([models.py:285-287](../../../dreamerv3-torch/models.py#L285-L287)) → `torch.save`에 같이 저장.
-- 호출 위치는 **단 한 곳**: `_compute_actor_loss`에서 `target` 정규화 ([models.py:404-408](../../../dreamerv3-torch/models.py#L404-L408)).
-- value loss나 critic 학습에는 들어가지 않음 — actor advantage 스케일 정규화 전용.
-- `scale ≥ 1.0` 클리핑 → 보상이 극단적으로 좁은 분포일 때 scale=0으로 폭발하는 것 방지.
+**reward_head shape** ([L65](../../../dreamerv3-torch/models.py#L65)): `(255,) if dist=='symlog_disc' else ()`. 기본 symlog_disc이므로 255-bin DiscDist (분포 본체는 [004 §1-2](004-dreamer_code_analysis_part2.md#1-2-discdist--twohot-인코딩-categorical-toolspy452-506)).
 
-### 1-2. `_update_slow_target` — polyak EMA ([models.py:435-441](../../../dreamerv3-torch/models.py#L435-L441))
+**reward vs cont outscale 차이** (configs.yaml:54, 56):
+- `reward_head.outscale = 0.0` — value/critic과 동일. Linear 마지막 weight가 거의 0 → 초기 예측 reward ≈ 0(symlog 공간), symexp 후 ≈ 0. 학습 초기 부트스트랩 안정.
+- `cont_head.outscale = 1.0` — 일반 초기화. Bernoulli logit 0 근처 → continue 확률 ≈ 0.5. 종료 미정 상태에서 시작.
 
-```python
-def _update_slow_target(self):
-    if self._config.critic["slow_target"]:                   # True (default)
-        if self._updates % self._config.critic["slow_target_update"] == 0:   # =1 매 step
-            mix = self._config.critic["slow_target_fraction"]                # =0.02
-            for s, d in zip(self.value.parameters(),
-                            self._slow_value.parameters()):
-                d.data = mix * s.data + (1 - mix) * d.data   # in-place polyak
-        self._updates += 1
-```
+**옵티마이저** ([L89-98](../../../dreamerv3-torch/models.py#L89-L98)): `_model_opt = tools.Optimizer('model', self.parameters(), lr=1e-4, eps=1e-8, clip=1000, wd=0, opt='adam', use_amp=...)`. **encoder/dynamics/decoder/reward/cont 모두 단일 옵티마이저로 통합 학습**. WD=0이므로 weight decay 미적용.
 
-- `slow_target_update=1` (configs.yaml 기본): 매 ImagBehavior._train 호출마다 EMA 한 번.
-- `slow_target_fraction=0.02`: τ=0.02. half-life ≈ 34 step.
-- `_slow_value = copy.deepcopy(self.value)` ([models.py:258](../../../dreamerv3-torch/models.py#L258))로 생성. requires_grad는 그대로지만 옵티마이저에 들어가지 않아 gradient는 받지 않고 EMA만으로 갱신.
-- 호출 시점: `_train` 진입 직후 ([models.py:295](../../../dreamerv3-torch/models.py#L295)) — actor/value 업데이트 **이전**.
+**loss scale 딕셔너리** ([L103-106](../../../dreamerv3-torch/models.py#L103-L106)): `_scales = {reward: reward_head.loss_scale, cont: cont_head.loss_scale}`. configs 기본 둘 다 1.0. 다른 head(decoder, KL)는 scale 1.0 고정으로 `_scales.get(key, 1.0)` ([L143-146](../../../dreamerv3-torch/models.py#L143-L146)).
 
-### 1-3. `objective`는 외부 주입 람다
+**`assert name in self.heads` for grad_heads** ([L87-88](../../../dreamerv3-torch/models.py#L87-L88)): config.grad_heads의 모든 이름이 실제 head 딕셔너리에 있는지 검증 — 오타 방지.
 
-`_train(self, start, objective)` 시그니처. reward를 만드는 `objective`는 호출처에서 정의.
+### 1-2. `_train(data)` — 단일 forward에서 모든 loss 계산 ([models.py:108-174](../../../dreamerv3-torch/models.py#L108-L174))
 
-`dreamer.py`의 task behavior 호출 ([dreamer.py:108-112](../../../dreamerv3-torch/dreamer.py#L108-L112) 부근):
-```python
-reward = lambda f, s, a: self._wm.heads["reward"](
-    self._wm.dynamics.get_feat(s)).mode()
-self._task_behavior._train(start, reward)
-```
+WorldModel 학습 알고리즘 핵심.
 
-- `objective: (feat, state, action) → reward[T, B*N, 1]` 임의의 람다.
-- 기본은 `reward_head(feat).mode()` — `DiscDist.mode()` = `symexp(Σ p·b)`. **원래 스케일의 reward**가 lambda_return에 들어감 (symlog 공간 X).
-- Plan2Explore에서는 disagreement 보너스로 교체 (7단계 예정).
+흐름:
+1. `data = self.preprocess(data)` — §1-4.
+2. `RequiresGrad(self)` 컨텍스트 + AMP autocast 안에서:
+   - `embed = self.encoder(data)` — shape `[B, T, embed_size]`.
+   - `post, prior = self.dynamics.observe(embed, data['action'], data['is_first'])` — RSSM observe ([004 §2-5](004-dreamer_code_analysis_part2.md#2-5-observe--imagine_with_action-networkspy127-152)).
+   - `kl_loss, kl_value, dyn_loss, rep_loss = self.dynamics.kl_loss(post, prior, kl_free, dyn_scale, rep_scale)` — KL balancing ([004 §2-7](004-dreamer_code_analysis_part2.md#2-7-kl_loss--kl-balancing-본체-networkspy272-290)).
+   - `assert kl_loss.shape == embed.shape[:2]` — `[B, T]` 형식 검증.
+   - **head 순회** ([L128-137](../../../dreamerv3-torch/models.py#L128-L137)):
+     - 매 head마다 `feat = self.dynamics.get_feat(post)` 새로 계산.
+     - `feat = feat if grad_head else feat.detach()` — `name in self._config.grad_heads`로 결정. 기본 `['decoder', 'reward', 'cont']` 모두 포함 → 모두 representation에 grad 흘림.
+     - `pred = head(feat)`. decoder는 `dict` 반환이라 `preds.update(pred)`로 키별 unpack. reward/cont는 단일 분포라 `preds[name] = pred`.
+   - **loss 누적** ([L138-147](../../../dreamerv3-torch/models.py#L138-L147)):
+     - `loss = -pred.log_prob(data[name])` per head — NLL.
+     - `assert loss.shape == embed.shape[:2]` per loss.
+     - `scaled = {k: v * self._scales.get(k, 1.0) for k, v in losses.items()}`.
+     - `model_loss = sum(scaled.values()) + kl_loss`.
+3. `metrics = self._model_opt(torch.mean(model_loss), self.parameters())` — 단일 옵티마이저 step.
+4. metric 정리 + `prior_ent`/`post_ent` 계산 (자체 autocast 컨텍스트 안).
+5. **`context` 딕셔너리** ([L167-172](../../../dreamerv3-torch/models.py#L167-L172)): `{embed, feat, kl, postent}` — Plan2Explore가 ensemble 학습 target으로 사용.
+6. **`post = {k: v.detach() for k, v in post.items()}`** ([L173](../../../dreamerv3-torch/models.py#L173)) — ImagBehavior에 출발점으로 넘기되 gradient 차단.
+7. 반환 `(post, context, metrics)`.
 
-### 1-4. `_imagine` — imagination rollout ([models.py:351-369](../../../dreamerv3-torch/models.py#L351-L369))
+### 1-3. KL balancing 디테일
 
-```python
-flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))      # (B,T,...) → (B*T,...)
-start = {k: flatten(v) for k, v in start.items()}            # post를 펼침
+KL 본체 동작은 [004 §2-7](004-dreamer_code_analysis_part2.md#2-7-kl_loss--kl-balancing-본체-networkspy272-290) 참조. WorldModel `_train` 시 적용 위치:
 
-def step(prev, _):
-    state, _, _ = prev
-    feat = dynamics.get_feat(state)
-    inp = feat.detach()                                       # ★ actor에는 detach된 feat
-    action = policy(inp).sample()                             # straight-through 적용
-    succ = dynamics.img_step(state, action)                   # prior 한 스텝
-    return succ, feat, action
+- `kl_free = config.kl_free = 1.0`, `dyn_scale = 0.5`, `rep_scale = 0.1` (configs.yaml:57-59).
+- `kl_loss`는 `[B, T]` shape이고 head loss들과 동일 차원으로 sum → `mean()` → 스칼라.
+- **kl_loss 자체가 `_scales` 딕셔너리에 들어가 있지 않음** — 1.0 가중. 모든 head loss와 같은 비율로 합산.
+- metric으로 `kl_free`, `dyn_scale`, `rep_scale`, `dyn_loss`, `rep_loss`, `kl`(=kl_value) 모두 로깅 ([L154-159](../../../dreamerv3-torch/models.py#L154-L159)).
 
-succ, feats, actions = tools.static_scan(
-    step, [torch.arange(horizon)], (start, None, None))       # horizon=15
-states = {k: torch.cat([start[k][None], v[:-1]], 0)           # 첫 step에 start 끼우기
-          for k, v in succ.items()}
-```
+### 1-4. `preprocess(obs)` ([models.py:177-192](../../../dreamerv3-torch/models.py#L177-L192))
 
-세부 포인트:
-- **`inp = feat.detach()`** ([L359](../../../dreamerv3-torch/models.py#L359)) — actor가 RSSM으로 gradient를 흘리지 못하게 차단. 단, `succ = img_step(state, action)`의 `state`는 detach되지 않아 dynamics gradient는 다음 step의 feat까지 살아 있음. 그래서 `imag_gradient='dynamics'` 모드에서 actor가 RSSM·decoder를 통해 학습 가능.
-- horizon = `imag_horizon = 15` (configs.yaml).
-- `start`는 WorldModel `_train`이 만든 post(`[B=16, T=64, ...]`)를 `flatten`으로 합쳐 batch dim이 `16*64=1024`. imagination은 **1024개 시작점에서 동시에 15-step rollout**.
-- 출력 shape: `feats=[T, B*T_data, F]`, `actions=[T, B*T_data, A]`. `feats[0]`은 start state의 feat, `feats[T-1]`은 마지막 prior의 feat.
-- `states`는 모든 step의 prior state (첫 자리에 start post를 끼움) — `_compute_target`의 cont head 입력.
+`_train`과 `_policy` 모두에서 호출.
 
-### 1-5. `_compute_target` — λ-return + weights ([models.py:371-389](../../../dreamerv3-torch/models.py#L371-L389))
+흐름:
+1. dict 전체를 `torch.tensor(device, dtype=float32)`로 변환.
+2. `obs['image'] = obs['image'] / 255.0` — **image 키 무조건 접근**. obs space에 image가 없으면 KeyError.
+3. `discount` 키가 obs에 있으면 `obs['discount'] *= config.discount` 후 마지막 차원에 unsqueeze(-1) — `[B, T] → [B, T, 1]`.
+4. `assert 'is_first' in obs` — RSSM `obs_step`의 first-step 리셋 필수.
+5. `assert 'is_terminal' in obs` — cont head 학습 라벨 필수.
+6. `obs['cont'] = (1.0 - obs['is_terminal']).unsqueeze(-1)` — Bernoulli target. `[B, T] → [B, T, 1]`.
 
-```python
-inp = dynamics.get_feat(imag_state)
-discount = self._config.discount * heads["cont"](inp).mean   # γ · P(continue)  (γ=0.997)
-value = self.value(imag_feat).mode()                          # [T, B, 1]
-target = tools.lambda_return(
-    reward[1:],          # [T-1, B, 1]   (t=1..T-1)
-    value[:-1],          # [T-1, B, 1]   (t=0..T-2)
-    discount[1:],        # [T-1, B, 1]
-    bootstrap=value[-1], # [B, 1]        terminal value
-    lambda_=0.95,
-    axis=0,
-)
-weights = torch.cumprod(
-    torch.cat([torch.ones_like(discount[:1]), discount[:-1]], 0), 0
-).detach()
-return target, weights, value[:-1]                            # base = V(s_t)
-```
+**image 키 접근 강제** ([L182](../../../dreamerv3-torch/models.py#L182))는 코드상 무조건 실행 — vector-only obs space는 KeyError. 의도된 비전 환경 가정.
 
-인덱싱·shape 가이드 (H=imag_horizon=15, N=B*T_data=1024):
-```
-imag_feat:    [H=15,   N, F]    feat[0]=start, feat[H-1]=마지막 prior
-imag_action:  [H,      N, A]
-imag_state:   [H,      N, ...]
-reward:       [H,      N, 1]
-value:        [H,      N, 1]
-discount:     [H,      N, 1]
+### 1-5. `video_pred(data)` — 학습 시각화 ([models.py:194-215](../../../dreamerv3-torch/models.py#L194-L215))
 
-lambda_return 입력 (axis=0 기준):
-  reward[1:]    → 길이 H-1=14   r_1..r_14
-  value[:-1]    → 길이 H-1      V_0..V_13
-  discount[1:]  → 길이 H-1      γ_1..γ_14
-  bootstrap=value[-1]            V_14
-target: tuple of 14, 각 [N, 1]            → stack(dim=1) → [N, 14, 1]
-weights: cumprod, 길이 H=15               → weights[:-1] = [14, N, 1]
-actor_loss = weights[:-1] * actor_target[:-1]
-```
+`config.video_pred_log = True` (configs.yaml:20)일 때 `Dreamer.__call__`이 train log 주기 + eval 후 호출 ([dreamer.py:74-76, 316-318](../../../dreamerv3-torch/dreamer.py#L74-L76)).
 
-핵심 디테일:
-- **discount는 학습되는 cont head의 출력**. `cont = Bernoulli(p)`, `cont.mean = p`. 종료 가능성이 높은 state에서 γ가 자동으로 작아짐. hard done 처리 없이 부드러운 종료.
-- **reward를 한 칸 뒤로 미는 인덱싱**: `target_t ← reward_{t+1} + γ_{t+1} (λ V_{t+1} + (1-λ) target_{t+1})`. λ-return의 표준 정의.
-- **`weights`** = `[1, γ_0, γ_0·γ_1, …]` cumprod → t step의 actor loss가 종료 확률에 따라 가중. `.detach()`로 gradient 차단 (continue head를 actor에서 학습시키지 않음).
-- `value`는 `self.value(imag_feat).mode()` — slow target이 아니라 **현재 value의 mode**. 부트스트랩은 현재 value, 정답 target은 별도 계산되어 value loss가 그 target에 맞춰 학습됨.
+동작:
+1. 배치 첫 6개 sequence 사용, 처음 5 step은 관측 기반 post:
+   - `states, _ = dynamics.observe(embed[:6, :5], action[:6, :5], is_first[:6, :5])`.
+   - `recon = heads['decoder'](get_feat(states))['image'].mode()[:6]` — 5 step 재구성.
+   - `reward_post = heads['reward'](get_feat(states)).mode()[:6]`.
+2. 6번째 step부터 imagination:
+   - `init = {k: v[:, -1] for k, v in states.items()}` — 5번째 step의 post를 출발점.
+   - `prior = dynamics.imagine_with_action(action[:6, 5:], init)` — 나머지 action으로 prior rollout ([004 §2-5](004-dreamer_code_analysis_part2.md#2-5-observe--imagine_with_action-networkspy127-152)).
+   - `openl = heads['decoder'](get_feat(prior))['image'].mode()` — open-loop 예측.
+   - `reward_prior = heads['reward'](get_feat(prior)).mode()`.
+3. **세로 패널 구성** ([L210-215](../../../dreamerv3-torch/models.py#L210-L215)):
+   - `model = cat([recon[:, :5], openl], 1)` — 모델 출력 (앞 5 = recon, 뒤 = openl).
+   - `truth = data['image'][:6]` — 실제 시퀀스.
+   - `error = (model - truth + 1.0) / 2.0` — 차이 시각화 (0.5 중심).
+   - `return cat([truth, model, error], 2)` — 세 행을 세로(H 축)로 쌓아 한 비디오.
+4. logger가 `video()`로 TensorBoard에 기록.
 
-### 1-6. `tools.lambda_return` ([tools.py:691-717](../../../dreamerv3-torch/tools.py#L691-L717))
+**image 키 하드코딩**: `data['image']`, `dists['image']` 직접 접근 — obs space에 image 키가 없으면 KeyError. `video_pred_log=False`로 끄는 게 vector-only 환경의 우회.
 
-```python
-next_values = torch.cat([value[1:], bootstrap[None]], 0)      # V_{t+1}, 마지막은 bootstrap
-inputs = reward + pcont * next_values * (1 - lambda_)         # r_t + γ(1-λ) V_{t+1}
-returns = static_scan_for_lambda_return(
-    lambda agg, cur0, cur1: cur0 + cur1 * lambda_ * agg,
-    (inputs, pcont), bootstrap)
-```
+### 1-6. 설계 포인트 (WorldModel)
 
-재귀식:
-```
-G_T   = bootstrap
-G_t   = (r_{t+1} + γ_{t+1}(1-λ) V_{t+1}) + γ_{t+1} λ G_{t+1}
-      = r_{t+1} + γ_{t+1} [(1-λ) V_{t+1} + λ G_{t+1}]
-```
+1. **3 head 단일 옵티마이저** — encoder/dynamics/decoder/reward/cont의 모든 파라미터를 `_model_opt` 하나로 통합 학습. actor/value는 별도 옵티마이저(§3-1).
+2. **단일 forward에서 모든 head loss 계산** — 효율적. 단 `image` 키 하드코딩 ([L182, L201, L207, L211](../../../dreamerv3-torch/models.py#L182)).
+3. **`grad_heads` 메커니즘** — 어느 head로부터 representation까지 gradient를 흘릴지 config로 제어. 기본은 셋 다 ON.
+4. **kl_loss는 scale 딕셔너리 외부** — 기본 1.0 가중. reward·cont만 명시적 scale.
+5. **`post` detach 후 반환** — ImagBehavior가 출발점으로만 쓰고 RSSM에 grad 흘리지 않게.
+6. **`context` 딕셔너리 반환** — Plan2Explore의 ensemble 학습 데이터로 사용 (006 §1).
+7. **AMP 컨텍스트** — `use_amp = (precision == 16)`. 기본 precision=32이므로 AMP OFF. precision=16 시 head loss 계산이 fp16에서 underflow 가능 — 그래서 metric autocast는 별도 컨텍스트로 둠.
+8. **video_pred는 학습 진단** — train/eval 시각화 전용. reward의 mode가 곁가지로 계산되지만 사용 안 됨 (코드에 있되 logger에 안 넘김).
+9. **reward outscale=0.0 vs cont outscale=1.0** — reward는 V≈0 초기화와 같은 정신(symlog 공간), cont는 0.5 확률 시작(불확실).
 
-`λ=1` → discounted Monte Carlo, `λ=0` → 1-step TD. Dreamer-v3 기본 `discount_lambda=0.95`.
+---
 
-**`static_scan_for_lambda_return`** ([tools.py:671-688](../../../dreamerv3-torch/tools.py#L671-L688)):
-- `reversed(indices)` 시간 역방향 스캔 (재귀가 미래→현재 방향이므로).
-- 매 step `last = fn(last, inputs[i], pcont[i])` 후 `torch.cat(..., dim=-1)`로 누적 → reshape & flip → `torch.unbind(dim=0)` → tuple of T-1 텐서.
-- ⚠️ 반환 타입이 **tuple** — 그래서 `_compute_actor_loss`/value loss에서 `torch.stack(target, dim=1)`이 필요.
+## 2. RewardEMA — 5/95 quantile EMA ([models.py:11-26](../../../dreamerv3-torch/models.py#L11-L26))
 
-### 1-7. `_compute_actor_loss` — 3가지 gradient 모드 ([models.py:391-433](../../../dreamerv3-torch/models.py#L391-L433))
+target return 정규화용 EMA. 5% / 95% quantile을 매우 느린 EMA로 유지.
 
-```python
-inp = imag_feat.detach()                                     # actor 입력 detach
-policy = self.actor(inp)
-target = torch.stack(target, dim=1)                           # tuple → [N, T-1, 1]
+### 2-1. 동작
 
-if reward_EMA:
-    offset, scale = self.reward_ema(target, self.ema_vals)
-    normed_target = (target - offset) / scale
-    normed_base   = (base   - offset) / scale
-    adv = normed_target - normed_base                         # advantage (정규화됨)
-else:
-    adv = target - base
+`__init__(device, alpha=1e-2)`:
+- `self.range = torch.tensor([0.05, 0.95], device=device)` — quantile 좌표.
+- `self.alpha = 1e-2` — EMA momentum. 매 호출마다 1%만 새 값 반영.
 
-if imag_gradient == "dynamics":         # default for continuous
-    actor_target = adv                                        # path-gradient: target→feat→action
-elif imag_gradient == "reinforce":      # default for discrete
-    actor_target = log π(a|s)[:-1] * (target - V(s)).detach()
-elif imag_gradient == "both":
-    mix = imag_gradient_mix
-    actor_target = mix*target + (1-mix)*log_prob*adv.detach()
+`__call__(x, ema_vals)`:
+1. `flat_x = x.detach().flatten()` — target을 1D로.
+2. `x_quantile = torch.quantile(flat_x, q=self.range)` — 현재 batch의 5%, 95% quantile (shape `[2]`).
+3. `ema_vals[:] = alpha * x_quantile + (1 - alpha) * ema_vals` — **in-place** EMA 갱신.
+4. `scale = torch.clip(ema_vals[1] - ema_vals[0], min=1.0)` — 5~95 range = scale. **하한 1.0** — 좁은 분포에서 scale=0 폭발 방지.
+5. `offset = ema_vals[0]` — 정규화 zero point.
+6. 반환 `(offset.detach(), scale.detach())`.
 
-actor_loss = -weights[:-1] * actor_target
-```
+### 2-2. 등록·사용 위치
 
-3 모드 의미:
-- **`dynamics`**: actor 출력 → RSSM(img_step에서 state 유지) → feat → value/reward를 통한 path gradient. continuous action에서 효과적 (액션이 미분가능). `target`이 그대로 loss에 들어가 backprop이 전체 imagination을 통과.
-- **`reinforce`**: 표준 policy gradient. discrete action(onehot)에서 사용. baseline은 `V(s)` 현재값. `(target - V).detach()`로 critic을 통해 backprop 안 됨.
-- **`both`**: 두 항을 `mix` 비율로 결합.
+- `ema_vals`는 `ImagBehavior.__init__`에서 buffer로 등록 ([models.py:285-287](../../../dreamerv3-torch/models.py#L285-L287)) — `torch.save`/`load_state_dict`에 자동 포함.
+- 초기값 `torch.zeros((2,))`.
+- 호출처는 **단 한 곳**: `_compute_actor_loss` ([models.py:404-408](../../../dreamerv3-torch/models.py#L404-L408)) — target advantage 정규화.
+- value loss나 critic 학습에는 들어가지 않음 → critic은 raw target에 학습되어 EMA 자기참조 회피.
 
-엔트로피 보너스는 별도로 ([models.py:317](../../../dreamerv3-torch/models.py#L317)):
-```python
-actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]   # entropy=3e-4
-```
+### 2-3. 설계 의미
 
-`weights[:-1]`로 곱해 종료 후 step의 loss는 0에 수렴. `[:-1]`은 마지막 step은 bootstrap이라 target이 없기 때문.
+- `alpha=1e-2`: 99% 과거 보존. half-life ≈ 70 step. 매우 보수적 — batch별 분포 진동에 흔들리지 않음.
+- 5/95 quantile (1/99이 아니라): outlier에 약간 robust하면서도 분포 전체를 커버.
+- `scale ≥ 1.0` 클리핑: scale이 1 미만이면 정규화가 advantage를 부풀려 학습 불안 — 1을 하한으로.
+- 환경마다 다른 reward 스케일을 actor 학습에 자동 적응시키는 메커니즘. v3가 환경별 hyperparameter 튜닝 없이 도는 핵심.
 
-### 1-8. Value loss — 두 항 동등 합산 ([models.py:322-332](../../../dreamerv3-torch/models.py#L322-L332))
+---
 
-```python
-value = self.value(value_input[:-1].detach())                # imag_feat detach
-target = torch.stack(target, dim=1)
-value_loss = -value.log_prob(target.detach())                # ① λ-return target에 대한 NLL
-slow_target = self._slow_value(value_input[:-1].detach())
-if critic["slow_target"]:
-    value_loss -= value.log_prob(slow_target.mode().detach()) # ② slow target의 mode에 대한 NLL
-value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
-```
+## 3. ImagBehavior (`models.py`)
 
-- 두 항이 **단순 합산** (가중치 없음). slow_target 항은 self-distill로 작용 → critic이 자기 EMA로 끌려가 학습 안정화.
-- `value`는 `symlog_disc` 분포 (255-bin DiscDist) — `log_prob(target)`은 target을 symlog 공간에서 255 bin twohot 인코딩한 cross-entropy (§2-2 참조).
-- `target.detach()` 명시적: λ-return은 dynamics gradient를 받지만 value loss용으로는 끊는다.
-- `value_input[:-1].detach()` — value head 학습이 actor·world model로 흘러가지 않도록 차단.
+위치: [models.py:218-441](../../../dreamerv3-torch/models.py#L218-L441). actor + value + slow target + reward EMA. imagination rollout 기반 actor-critic.
 
-### 1-9. Optimizer 흐름 ([tools.py:720-772](../../../dreamerv3-torch/tools.py#L720-L772))
+### 3-0. 함수 호출 그래프
 
-```python
-def __call__(self, loss, params, retain_graph=True):
-    self._opt.zero_grad()
-    self._scaler.scale(loss).backward(retain_graph=retain_graph)   # AMP scale
-    self._scaler.unscale_(self._opt)                                # unscale 전에 clip
-    norm = torch.nn.utils.clip_grad_norm_(params, self._clip)       # ① global norm clip
-    if self._wd:
-        self._apply_weight_decay(params)                            # ② decoupled WD
-    self._scaler.step(self._opt)
-    self._scaler.update()
-    self._opt.zero_grad()
-    return {"_loss": ..., "_grad_norm": norm}
-```
+`ImagBehavior._train(start, objective)` ([L290](../../../dreamerv3-torch/models.py#L290))
+- `_update_slow_target()` — polyak EMA.
+- `_imagine(start, actor, H=15)` — imagination rollout.
+  - `tools.static_scan(step, range(H), (start, None, None))`.
+- `objective(feat, state, action)` — 외부 주입 람다 (보통 reward head).
+- `actor(imag_feat).entropy()` — actor 엔트로피.
+- `dynamics.get_dist(imag_state).entropy()` — state 엔트로피 (사용 안 함, metric 외).
+- `_compute_target(imag_feat, imag_state, reward)`.
+  - `cont_head(inp).mean` → discount.
+  - `value(imag_feat).mode()`.
+  - `tools.lambda_return(...)`.
+    - `static_scan_for_lambda_return(...)`.
+- `_compute_actor_loss(imag_feat, imag_action, target, weights, base)`.
+  - `self.reward_ema(target, ema_vals)`.
+- value loss 계산.
+- `_actor_opt(actor_loss, ...)`, `_value_opt(value_loss, ...)`.
 
-- **AMP + grad clip 정석 패턴**: `scale → backward → unscale → clip → step → update`.
-- **Decoupled weight decay** ([L767-772](../../../dreamerv3-torch/tools.py#L767-L772)): `var.data *= (1 - wd)`. AdamW와 동일한 방식이지만 직접 구현. `wd_pattern='.*'` 아니면 NotImplemented (모든 파라미터 동일하게).
-- `retain_graph=True` — 같은 graph로 actor → value를 연달아 backward 하기 위해.
-- 호출 순서 ([models.py:346-348](../../../dreamerv3-torch/models.py#L346-L348)):
-  ```python
-  metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
-  metrics.update(self._value_opt(value_loss, self.value.parameters()))
-  ```
-  actor 먼저, value 나중. 둘 다 `imag_feat`를 detach하므로 두 graph가 독립적이지만 imagination rollout(`img_step` 내부 state)을 공유하기 때문에 `retain_graph=True` 필수.
+### 3-1. `__init__` — actor, value, slow_value, 2 옵티마이저 ([models.py:219-288](../../../dreamerv3-torch/models.py#L219-L288))
 
-### 1-10. 설계 포인트
+| 컴포넌트 | 분포 / 옵션 | 위치 |
+|---|---|---|
+| `actor = MLP(feat → num_actions, layers=2, dist=actor.dist, std='learned', absmax=1.0, ...)` | continuous: `dist='normal'` (`ContDist(Normal(tanh(mean), sigmoid_std))`). discrete: `dist='onehot'`. | [L228-244](../../../dreamerv3-torch/models.py#L228-L244) |
+| `value = MLP(feat → 255 if symlog_disc, layers=2, outscale=0.0)` | `dist='symlog_disc'` → DiscDist 255-bin. outscale=0.0이라 초기 V≈0. | [L245-256](../../../dreamerv3-torch/models.py#L245-L256) |
+| `_slow_value = copy.deepcopy(self.value)` | target net. polyak EMA로만 갱신. 옵티마이저 미등록 → gradient 안 받음. | [L257-259](../../../dreamerv3-torch/models.py#L257-L259) |
+| `_updates = 0` | slow target 갱신 카운터. | [L259](../../../dreamerv3-torch/models.py#L259) |
+| `_actor_opt`, `_value_opt` (둘 다 `tools.Optimizer`) | 분리 — WorldModel `_model_opt`까지 총 3개. | [L261-282](../../../dreamerv3-torch/models.py#L261-L282) |
+| `ema_vals` buffer (`torch.zeros((2,))`) + `reward_ema = RewardEMA(device)` | reward_EMA=True일 때만. checkpoint 포함. | [L283-288](../../../dreamerv3-torch/models.py#L283-L288) |
+
+actor hyperparameter (configs.yaml:49-50):
+- `lr=3e-5`, `eps=1e-5`, `grad_clip=100`.
+- `entropy=3e-4` (loss 가중치).
+- `dist='normal'` (continuous 환경 기본). 다른 분포는 [004 §1-9](004-dreamer_code_analysis_part2.md#1-9-head--분포-매핑-표) 참조.
+- `std='learned'`, `min_std=0.1`, `max_std=1.0`.
+- `unimix_ratio=0.01` (onehot일 때).
+
+critic hyperparameter (configs.yaml:51-52):
+- `lr=3e-5`, `eps=1e-5`, `grad_clip=100`.
+- `dist='symlog_disc'` (DiscDist 255-bin).
+- `slow_target=True`, `slow_target_update=1`, `slow_target_fraction=0.02`.
+- `outscale=0.0`.
+
+`kw = dict(wd=weight_decay=0, opt='adam', use_amp=...)` ([L260](../../../dreamerv3-torch/models.py#L260)) — actor/value 옵티마이저 공통 인자.
+
+### 3-2. `_train(start, objective)` — 전체 흐름 ([models.py:290-349](../../../dreamerv3-torch/models.py#L290-L349))
+
+흐름:
+1. `_update_slow_target()` — §3-3.
+2. **actor lane** (`RequiresGrad(self.actor)` + AMP autocast):
+   - `imag_feat, imag_state, imag_action = _imagine(start, self.actor, imag_horizon=15)` — §3-4.
+   - `reward = objective(imag_feat, imag_state, imag_action)` — §3-3 외부 람다.
+   - `actor_ent = self.actor(imag_feat).entropy()` — entropy 계산.
+   - `state_ent = world_model.dynamics.get_dist(imag_state).entropy()` — 계산하나 사용 안 함 (metric에도 안 들어감).
+   - `target, weights, base = _compute_target(imag_feat, imag_state, reward)` — §3-5.
+   - `actor_loss, mets = _compute_actor_loss(imag_feat, imag_action, target, weights, base)` — §3-7.
+   - `actor_loss -= entropy * actor_ent[:-1, ..., None]` ([L317](../../../dreamerv3-torch/models.py#L317)) — entropy bonus 차감. `[:-1]`로 마지막 bootstrap step 제외.
+   - `actor_loss = torch.mean(actor_loss)` — 스칼라로.
+3. **value lane** (`RequiresGrad(self.value)` + AMP):
+   - `value = self.value(value_input[:-1].detach())` — `value_input = imag_feat`. detach로 actor lane gradient 차단. `[:-1]`로 length T−1=14.
+   - `target = torch.stack(target, dim=1)` — tuple → tensor. **shape `[T-1, N, 1]` (time-major)** — 005 이전 판에 적힌 `[N, T-1, 1]`은 오류였음. 자세히 §3-6.
+   - `value_loss = -value.log_prob(target.detach())` — λ-return target NLL.
+   - `if slow_target: slow_target = self._slow_value(value_input[:-1].detach()); value_loss -= value.log_prob(slow_target.mode().detach())` — slow self-distill 항 추가.
+   - `value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])` — weights로 가중 후 평균.
+4. metric 누적 (value mode, target stats, imag_reward, imag_action 등).
+5. `RequiresGrad(self)` 컨텍스트에서:
+   - `_actor_opt(actor_loss, self.actor.parameters())`.
+   - `_value_opt(value_loss, self.value.parameters())`.
+6. 반환 `(imag_feat, imag_state, imag_action, weights, metrics)`.
+
+`RequiresGrad`는 `__enter__`에서 `requires_grad_(True)`, `__exit__`에서 `False` ([tools.py:31-39](../../../dreamerv3-torch/tools.py#L31-L39)) — actor·value lane이 독립적으로 grad on/off되어 forward 그래프가 다른 lane에 누출되지 않음.
+
+### 3-3. `_update_slow_target` — polyak EMA ([models.py:435-441](../../../dreamerv3-torch/models.py#L435-L441))
+
+동작:
+- `if slow_target:` 가드.
+- `if self._updates % slow_target_update == 0:` — `slow_target_update=1` (기본) → 매 `_train` 호출마다 갱신.
+- `mix = slow_target_fraction = 0.02` — τ.
+- `for s, d in zip(self.value.parameters(), self._slow_value.parameters()): d.data = mix*s.data + (1-mix)*d.data` — in-place polyak.
+- `self._updates += 1`.
+
+특징:
+- `_slow_value`는 `copy.deepcopy(self.value)`이라 같은 구조. requires_grad는 그대로 True지만 옵티마이저 미등록 → gradient는 받지 않고 EMA로만 갱신.
+- 호출 시점: `_train` 진입 직후, actor/value 업데이트 **이전**.
+- `mix=0.02`, half-life ≈ 34 step. 매우 부드러움.
+- 큰 주기 + hard copy 대신 매 step polyak — Dreamer-v3 안정성 기법.
+
+### 3-3. `objective`는 외부 주입 람다
+
+`_train(self, start, objective)` 시그니처. reward를 만드는 람다는 호출처에서 정의.
+
+**task behavior 호출** ([dreamer.py:122-124](../../../dreamerv3-torch/dreamer.py#L122-L124)):
+- `reward = lambda f, s, a: self._wm.heads["reward"](self._wm.dynamics.get_feat(s)).mode()`
+- 입력 `s`(state)에서 `get_feat`로 feat 계산 후 reward head 통과.
+- `.mode()` — `DiscDist.mode() = symexp(Σ p·b)` ([004 §1-2](004-dreamer_code_analysis_part2.md#1-2-discdist--twohot-인코딩-categorical-toolspy452-506)). **원래 스케일의 reward**가 lambda_return에 들어감 (symlog 공간 X).
+
+**Plan2Explore 생성용 reward (다른 람다)** ([dreamer.py:51](../../../dreamerv3-torch/dreamer.py#L51)):
+- `reward = lambda f, s, a: self._wm.heads["reward"](f).mean()`
+- 입력 `f`(feat) 그대로 head 통과 — `get_feat` 단계 생략.
+- `.mean()` — `DiscDist.mean()`은 `mode()`와 본문 동일 ([004 §1-2](004-dreamer_code_analysis_part2.md#1-2-discdist--twohot-인코딩-categorical-toolspy452-506))이라 결과 값은 같음.
+- 이 람다는 `Plan2Explore(config, wm, reward)`로 전달되어 `_intrinsic_reward`의 extrinsic 보너스 항(`expl_extr_scale > 0`인 경우)에서 사용 (006 §1).
+
+**Plan2Explore의 task behavior 학습 람다** ([exploration.py:104](../../../dreamerv3-torch/exploration.py#L104)): `self._behavior._train(start, self._intrinsic_reward)` — disagreement 보너스를 objective로 주입. ImagBehavior 클래스 재사용으로 explore policy를 같은 인프라로 학습.
+
+### 3-4. `_imagine` — imagination rollout ([models.py:351-369](../../../dreamerv3-torch/models.py#L351-L369))
+
+흐름:
+1. `flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))` — `(B, T, ...) → (B·T, ...)`.
+2. `start = {k: flatten(v) for k, v in start.items()}` — post를 펼침. WorldModel `_train`이 만든 post는 `[B=16, T=64, ...]`이라 batch dim이 `16·64 = 1024`.
+3. **step 함수**:
+   - `state, _, _ = prev` (이전 step의 (succ_state, feat, action)).
+   - `feat = dynamics.get_feat(state)` — 현재 state의 feat.
+   - `inp = feat.detach()` — **actor 입력은 detach** (actor가 RSSM에 직접 backprop 못 함).
+   - `action = policy(inp).sample()` — actor 출력. STE 적용된 sample.
+   - `succ = dynamics.img_step(state, action)` — **state는 detach 안 함**. dynamics gradient는 다음 step의 feat까지 살아 있음.
+   - 반환 `(succ, feat, action)`.
+4. `succ, feats, actions = tools.static_scan(step, [arange(horizon)], (start, None, None))` — horizon=15.
+5. `states = {k: cat([start[k][None], v[:-1]], 0) for k, v in succ.items()}` — 첫 자리에 start post를 끼우고 prior의 마지막 step은 제외 → `states[0]=start`, `states[t]=succ[t-1]`.
+6. 반환 `(feats, states, actions)`. shape: `feats=[H=15, N=1024, F]`, `actions=[H, N, A]`, `states[k]=[H, N, ...]`.
+
+**비대칭 detach의 의미**:
+- `inp = feat.detach()` — actor가 dynamics를 통한 backprop 못 함. actor parameter 학습은 path-derivative(target → feat → ... → action)로만.
+- `succ = img_step(state, action)`의 `state`는 detach 안 됨 — dynamics 자체는 grad 받음.
+- 결과: `imag_gradient='dynamics'` 모드에서 actor 출력 → RSSM(미분가능) → 다음 feat → value/reward → target → loss → backprop이 전체 imagination 통과 가능.
+
+### 3-5. `_compute_target` — λ-return + weights ([models.py:371-389](../../../dreamerv3-torch/models.py#L371-L389))
+
+흐름:
+1. `inp = world_model.dynamics.get_feat(imag_state)` — 모든 state의 feat (start 포함).
+2. `discount = config.discount * world_model.heads['cont'](inp).mean` — `γ · P(continue)`. γ=0.997 (configs.yaml:76). cont head의 Bernoulli `.mean = sigmoid(logits)` = 확률.
+3. `value = self.value(imag_feat).mode()` — shape `[H, N, 1]`. **slow target이 아니라 현재 value의 mode** — 부트스트랩은 현재 value, 학습 target은 별도 계산.
+4. `target = tools.lambda_return(reward[1:], value[:-1], discount[1:], bootstrap=value[-1], lambda_=0.95, axis=0)` — §3-6.
+5. `weights = cumprod(cat([ones_like(d[:1]), d[:-1]], 0), 0).detach()` — **선두 1을 끼우고** cumprod. `weights[0]=1`, `weights[t] = ∏_{i<t} discount_i`. shape `[H, N, 1]`.
+6. 반환 `(target, weights, base=value[:-1])`.
+
+**선두 1의 의미**: actor loss는 `weights[:-1] * actor_target`. weights[0]=1이라 첫 step은 discount 없이 full 가중치. 만약 선두 1이 없었다면 cumprod(discount)로 weights[0]=discount[0]이 되어 첫 step부터 discount가 곱해져 학습 신호가 약해짐.
+
+**reward·value·discount 인덱스 슬라이싱** (lambda_return 입력 정렬, axis=0):
+- `reward[1:]` — t=1..H-1. r_{t+1}로 사용.
+- `value[:-1]` — t=0..H-2. V_t로 사용.
+- `discount[1:]` — t=1..H-1. γ_{t+1}로 사용.
+- `bootstrap = value[-1]` — V_H로 사용.
+- 길이 모두 H-1 = 14.
+
+shape 가이드 (H=15, N=B·T=1024):
+- `imag_feat`: `[15, 1024, 1536]` (discrete RSSM)
+- `imag_state[k]`: `[15, 1024, ...]`
+- `reward`, `value`, `discount`: `[15, 1024, 1]`
+- `weights`: `[15, 1024, 1]`
+- `base = value[:-1]`: `[14, 1024, 1]`
+
+### 3-6. `tools.lambda_return` + `static_scan_for_lambda_return` ([tools.py:671-717](../../../dreamerv3-torch/tools.py#L671-L717))
+
+**lambda_return** ([tools.py:691-717](../../../dreamerv3-torch/tools.py#L691-L717)):
+- 입력 dim 검증, axis가 0이 아니면 permute (호출처에선 axis=0이라 permute 안 일어남).
+- `next_values = cat([value[1:], bootstrap[None]], 0)` — V_{t+1} 시퀀스. 마지막은 bootstrap.
+- `inputs = reward + pcont * next_values * (1 - lambda_)` — λ-return의 "현재 step 부분" `r_{t+1} + γ_{t+1}(1-λ) V_{t+1}`.
+- `returns = static_scan_for_lambda_return(lambda agg, cur0, cur1: cur0 + cur1*lambda_*agg, (inputs, pcont), bootstrap)` — 재귀 G_t = inputs[t] + pcont[t]·λ·G_{t+1}.
+- axis 복원 후 반환.
+
+재귀식 정리:
+- `G_T = bootstrap = V_H`
+- `G_t = inputs[t] + pcont[t]·λ·G_{t+1}`
+- `inputs[t] = r_{t+1} + γ_{t+1}(1-λ) V_{t+1}`
+- `pcont[t] = γ_{t+1}`
+- 풀어쓰면: **G_t = r_{t+1} + γ_{t+1}[(1-λ) V_{t+1} + λ G_{t+1}]**.
+- `λ=1`: discounted Monte Carlo. `λ=0`: 1-step TD. 기본 0.95.
+
+**static_scan_for_lambda_return** ([tools.py:671-688](../../../dreamerv3-torch/tools.py#L671-L688)):
+- `indices = reversed(range(T-1))` — 시간 역방향 스캔 (재귀가 미래→현재).
+- 매 step `last = fn(last, inputs[index], pcont[index])` — `last` shape `[N, 1]` 유지.
+- 누적: `outputs = torch.cat([outputs, last], dim=-1)` — 마지막 차원에 붙임. T-1 iteration 후 shape `[N, T-1]`.
+- `outputs = reshape(outputs, [N, T-1, 1])` → `flip(dim=[1])` (시간 순서 복원) → `unbind(dim=0)`.
+
+**중요한 shape 정정**: `unbind(dim=0)`는 dim 0(=N) 기준 분해 → **tuple of N 텐서, 각 shape `[T-1, 1]`**. (이전 005 판에 적힌 "tuple of T-1, 각 [N, 1]"은 오류였음.)
+
+**후속 stack** ([models.py:325, 403](../../../dreamerv3-torch/models.py#L325)):
+- `torch.stack(target, dim=1)` — N개의 `[T-1, 1]` 텐서를 dim=1에 쌓음 → 결과 shape **`[T-1, N, 1]`** (time-major).
+- 이후 actor_loss/value_loss 계산이 time-major 기준 정합 — base=value[:-1] [T-1, N, 1], weights[:-1] [T-1, N, 1] 모두 time-major이라 broadcast 일관.
+
+### 3-7. `_compute_actor_loss` — 3 모드 ([models.py:391-433](../../../dreamerv3-torch/models.py#L391-L433))
+
+흐름:
+1. `inp = imag_feat.detach()` — actor 입력 detach.
+2. `policy = self.actor(inp)` — 분포 재구성.
+3. `target = torch.stack(target, dim=1)` — `[T-1, N, 1]` (§3-6).
+4. **RewardEMA 적용** (configs.yaml:30 기본 `reward_EMA=True`) ([L404-408](../../../dreamerv3-torch/models.py#L404-L408)):
+   - `offset, scale = self.reward_ema(target, self.ema_vals)` — §2.
+   - `normed_target = (target - offset) / scale`.
+   - `normed_base = (base - offset) / scale`. (base = value[:-1] [T-1, N, 1].)
+   - `adv = normed_target - normed_base` — advantage on normalized scale.
+   - reward_EMA OFF: `adv = target - base` (raw).
+5. **3 gradient 모드** ([L415-431](../../../dreamerv3-torch/models.py#L415-L431)):
+   - `'dynamics'` (continuous 기본): `actor_target = adv` — path-derivative. RSSM이 미분가능하므로 target에서 actor parameter까지 grad 흐름.
+   - `'reinforce'` (discrete 기본 — atari/crafter/minecraft/memorymaze config가 override): `actor_target = log π(a|s)[:-1][:, :, None] * (target - value(imag_feat[:-1]).mode()).detach()` — 표준 policy gradient. baseline은 현재 value 호출 (slow가 아님).
+   - `'both'`: `mix = imag_gradient_mix=0.0` (기본). `actor_target = mix*target + (1-mix)*reinforce_term`. 기본 mix=0이라 사실상 reinforce.
+6. `actor_loss = -weights[:-1] * actor_target` ([L432](../../../dreamerv3-torch/models.py#L432)) — `weights[:-1]` shape `[T-1, N, 1]`, actor_target shape `[T-1, N, 1]`. **actor_target에는 별도 [:-1] 슬라이싱 없음** (이전 005에 "actor_target[:-1]"이라 적은 부분은 오류).
+7. 반환 `(actor_loss, metrics)`.
+
+`_train`에서 후처리 ([L317](../../../dreamerv3-torch/models.py#L317)):
+- `actor_loss -= entropy * actor_ent[:-1, ..., None]` — entropy bonus 차감. actor_ent shape `[H, N]`이라 `[:-1]`로 길이 맞춤 후 `[..., None]`로 마지막 차원 추가.
+- 그 후 `mean()`로 스칼라화.
+
+### 3-8. Value loss — λ-return + slow self-distill ([models.py:322-332](../../../dreamerv3-torch/models.py#L322-L332))
+
+흐름:
+1. `value = self.value(value_input[:-1].detach())` — DiscDist. `value_input = imag_feat`, `[:-1]` → length T-1. `.detach()` — actor lane gradient 차단.
+2. `target = torch.stack(target, dim=1)` — `[T-1, N, 1]`. (actor lane에서 이미 stack했지만 value lane도 다시 stack — 둘은 다른 컨텍스트.)
+3. `value_loss = -value.log_prob(target.detach())` — DiscDist NLL. shape `[T-1, N]` (DiscDist.log_prob이 마지막 차원 sum).
+4. **slow self-distill** (slow_target=True 기본):
+   - `slow_target = self._slow_value(value_input[:-1].detach())` — DiscDist.
+   - `value_loss -= value.log_prob(slow_target.mode().detach())` — slow의 mode를 추가 target으로.
+5. `value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])` — `weights[:-1]` shape `[T-1, N, 1]`. `value_loss[:, :, None]`로 마지막 차원 추가 → broadcast.
+
+**두 항의 가중치는 동등**. slow 항을 별도로 가중하는 hyperparameter 없음. λ-return target과 slow target.mode가 단순 합산 cross-entropy.
+
+`target.detach()` 명시: λ-return은 actor lane에서 dynamics gradient를 받지만 value loss에서는 차단 — value 학습 신호가 dynamics로 흘러가면 representation이 value에 끌려가 학습 불안.
+
+`value_input[:-1].detach()`: value head 학습이 actor·world model로 누출 안 되게.
+
+### 3-9. 설계 포인트 (ImagBehavior)
 
 1. **`feat.detach()`는 actor 입력에만**: imagination rollout 자체의 `img_step(state, action)`은 state를 detach하지 않아 dynamics gradient가 살아 있다. 이 비대칭성이 `imag_gradient='dynamics'` 모드의 핵심.
-2. **discount = γ · cont_head.mean**: hard done이 아닌 soft termination. weights도 cont를 통해 자동 0 수렴.
+2. **discount = γ · cont_head.mean**: hard done이 아닌 soft termination. weights도 cont를 통해 자동 0 수렴. (단, cont head는 train data로 학습되어 imagination 분포에서 정확성은 모델 일반화에 의존.)
 3. **RewardEMA는 actor만**: critic은 raw target에 학습 → critic 출력이 EMA에 의존하지 않아 부트스트랩 자기참조 회피.
 4. **Value loss self-distill (slow_target.mode 항)**: target net을 부트스트랩으로만 쓰는 게 아니라 별도 항으로 직접 distill → λ-return target이 잡음일 때도 slow가 anchor 역할.
 5. **`slow_target_update=1` + `fraction=0.02`**: 매 step polyak. 큰 주기 + hard copy 대신 부드러운 EMA로 안정성.
-6. **3가지 imag_gradient 모드**: continuous는 `dynamics`(path), discrete는 `reinforce`(REINFORCE), `both`는 두 모드 결합. v3는 환경별로 actor.dist에 따라 자동 선택.
-7. **`retain_graph=True`**: actor와 value가 같은 imagination graph를 공유 — 두 번 backward 가능해야 함.
-8. **lambda_return이 tuple 반환**: `static_scan_for_lambda_return`이 unbind로 끝나서 tuple. 호출처에서 `torch.stack(..., dim=1)`로 시간축을 두 번째로 두는 형태(`[N, T, ...]`)로 정규화.
-9. **`objective` 람다 주입 설계**: reward 함수를 외부에서 갈아끼울 수 있어 task behavior(=실제 reward)와 explore behavior(=disagreement 보너스)를 같은 `ImagBehavior` 클래스로 학습 가능.
+6. **3가지 imag_gradient 모드**: continuous는 `dynamics`(path), discrete는 `reinforce`(REINFORCE), `both`는 두 모드 결합. v3는 환경별로 actor.dist에 따라 config로 선택 (atari/crafter 등 onehot 환경은 `imag_gradient='reinforce'` override).
+7. **`retain_graph=True`** (Optimizer 본체는 §4): actor와 value가 같은 imagination graph를 공유 — 두 번 backward 가능해야 함.
+8. **lambda_return이 tuple 반환**: `unbind(dim=0)`로 N개 tensor (each `[T-1, 1]`) → 호출처에서 `stack(dim=1)` → `[T-1, N, 1]` time-major.
+9. **`objective` 람다 주입 설계**: reward 함수를 외부에서 갈아끼울 수 있어 task behavior(=실제 reward)와 explore behavior(=disagreement 보너스, 006 §1)를 같은 `ImagBehavior` 클래스로 학습 가능.
+10. **`reward_EMA` toggle**: configs.yaml:30 기본 True. False 시 `adv = target - base` raw 정규화.
+11. **state_ent 계산되나 미사용** ([L305](../../../dreamerv3-torch/models.py#L305)): 코드에 있으나 actor_loss/value_loss/metric 어디에도 안 들어감. JAX 원본의 잔재 추정.
 
 ---
 
-## 2. Heads & 분포 (`tools.py`)
+## 4. Optimizer 래퍼 (`tools.py`)
 
-### 2-1. `symlog` / `symexp` ([tools.py:23-28](../../../dreamerv3-torch/tools.py#L23-L28))
+위치: [tools.py:720-772](../../../dreamerv3-torch/tools.py#L720-L772). WorldModel·actor·value 세 옵티마이저가 모두 이 클래스 인스턴스.
 
-```python
-symlog(x) = sign(x) · log(1 + |x|)
-symexp(x) = sign(x) · (exp(|x|) - 1)
-```
+### 4-1. `__init__` ([L720-747](../../../dreamerv3-torch/tools.py#L720-L747))
 
-- 부호 보존 로그 변환. `symlog(0)=0`, 단조증가·미분가능(원점 제외 매끄러움).
-- `symexp(symlog(x)) = x` 정확히 역함수.
-- 미분: `d symlog/dx = 1/(1+|x|)`. 큰 |x|에서 gradient가 줄어 outlier에 둔감.
-- Dreamer-v3는 이 함수를 **세 곳**에서 사용:
-  1. encoder MLP 입력 — raw 관측을 압축 ([networks.py:659-660](../../../dreamerv3-torch/networks.py#L659-L660))
-  2. `SymlogDist` — vector decoder 출력 ([tools.py:532-561](../../../dreamerv3-torch/tools.py#L532-L561))
-  3. `DiscDist` — reward/value head ([tools.py:452-506](../../../dreamerv3-torch/tools.py#L452-L506))
+인자:
+- `name`, `parameters`, `lr`, `eps=1e-4`, `clip=None`, `wd=None`, `wd_pattern=r".*"`, `opt='adam'`, `use_amp=False`.
 
-### 2-2. `DiscDist` — twohot 인코딩 categorical ([tools.py:452-506](../../../dreamerv3-torch/tools.py#L452-L506))
+내부:
+- `self._opt`: opt 키에 따라 `Adam`/`Adamax`/`SGD`/`SGD(momentum=0.9)` 생성. `'nadam'`은 NotImplemented.
+- `self._scaler = torch.cuda.amp.GradScaler(enabled=use_amp)` — AMP scaler.
+- `assert 0 <= wd < 1`, `assert not clip or 1 <= clip` — 입력 검증.
 
-reward head, value head 둘 다 이거. 스칼라 회귀를 **255-bin 분류**로 바꾼다.
+### 4-2. `__call__(loss, params, retain_graph=True)` ([L749-765](../../../dreamerv3-torch/tools.py#L749-L765))
 
-#### bucket 구성
-```python
-self.buckets = torch.linspace(-20.0, 20.0, steps=255)  # symlog 공간 255개
-self.width   = 40.0 / 255 ≈ 0.157
-```
-- 도메인: **symlog 공간**의 [-20, 20]. symexp 복원하면 원래 스케일 [-exp(20)+1, exp(20)-1] ≈ ±4.85e8. 사실상 모든 보상/가치를 커버.
+흐름 (AMP + grad clip 정석 패턴):
+1. `assert len(loss.shape) == 0` — 스칼라 강제.
+2. `self._opt.zero_grad()`.
+3. `self._scaler.scale(loss).backward(retain_graph=retain_graph)` — AMP scale 후 backward.
+4. `self._scaler.unscale_(self._opt)` — unscale 후 clip 가능 상태로.
+5. `norm = clip_grad_norm_(params, self._clip)` — global norm clip.
+6. `if self._wd: self._apply_weight_decay(params)` — decoupled weight decay.
+7. `self._scaler.step(self._opt)` — scaler 통해 step (`inf`/`nan` 자동 스킵).
+8. `self._scaler.update()` — scale factor 적응.
+9. `self._opt.zero_grad()` (중복이지만 안전).
+10. 반환 `{name_loss, name_grad_norm}` metric.
 
-#### `mode()` / `mean()`
-```python
-expected_symlog = Σ_i probs_i · buckets_i      # 가중합 (255 bin)
-return symexp(expected_symlog)                  # 원래 스케일로 복원
-```
-- `mode`와 `mean`이 동일 — 진짜 mode가 아닌 expectation. categorical의 expectation을 점추정으로 쓴다.
+### 4-3. Decoupled weight decay ([L767-772](../../../dreamerv3-torch/tools.py#L767-L772))
 
-#### `log_prob(x)` — twohot 인코딩 (핵심)
-```python
-x = symlog(x)                                          # 1. target을 symlog 공간으로
-# x shape: [..., 1] 가정 (reward/value는 마지막 차원 1)
-below = max index where buckets[i] <= x[..., None]    # [..., 1] (broadcast 위해 차원 추가)
-above = below + 1 (혹은 동일)
-below = clip(below, 0, 254);  above = clip(above, 0, 254)
-dist_to_below = |buckets[below] - x|
-dist_to_above = |buckets[above] - x|
-weight_below = dist_to_above / total                   # 가까운 쪽이 큰 가중치
-weight_above = dist_to_below / total
-target = onehot(below)*w_below + onehot(above)*w_above # 두 bin에만 질량
-target = target.squeeze(-2)                            # ★ [..., 1, 255] → [..., 255]
-log_pred = logits - logsumexp(logits)                  # log_softmax
-return (target * log_pred).sum(-1)                     # cross-entropy
-```
+- `wd_pattern != r".*"`이면 NotImplemented — 모든 파라미터에 동일 wd만 지원.
+- `for var in varibs: var.data = (1 - self._wd) * var.data` — AdamW와 동등한 weight decay를 직접 구현.
+- configs.yaml:60 `weight_decay=0`이라 기본 비활성.
 
-**왜 twohot인가**:
-- 표준 one-hot은 가까운 두 bin 사이의 부드러운 회귀 신호를 못 준다. twohot은 정확히 두 인접 bin에 거리 가중치로 질량을 분배 → 회귀와 분류의 장점 결합.
-- C51(distributional RL)의 projection과 같은 아이디어.
+### 4-4. `retain_graph=True`의 의미
 
-**구현 디테일**:
-- `x[..., None]`로 마지막에 차원 하나 추가 후 `buckets`와 broadcast 비교 → `below`/`above`가 `x`와 같은 leading shape. value/reward는 `[..., 1]`이라 `target.squeeze(-2)`로 그 차원을 제거해야 `log_pred [..., 255]`와 곱이 맞는다.
-- target이 [-20, 20] 밖이면 `clip(below/above, 0, 254)` → out-of-range gradient는 끝 bin에 모임. 정상 학습 범위는 symexp(20)≈4.85e8까지라 거의 안 부딪힘.
+`ImagBehavior._train`에서 actor_loss → backward 후 value_loss → backward를 연달아 호출. 두 loss가 같은 imagination graph(`_imagine` 출력)를 공유 — 첫 backward가 graph를 해제하면 두 번째가 실패. `retain_graph=True`로 첫 backward 후 graph 보존.
 
-### 2-3. `SymlogDist` — vector reconstruction ([tools.py:532-561](../../../dreamerv3-torch/tools.py#L532-L561))
+WorldModel의 `_model_opt`은 단독 backward이므로 `retain_graph`가 의미 없으나 default가 True라 그대로 사용.
 
-MultiDecoder의 vector head에서 사용. **연속 분포가 아니라 MSE의 symlog 버전**.
+### 4-5. 설계 포인트 (Optimizer)
 
-```python
-log_prob(value):
-    distance = (self._mode - symlog(value))**2      # target만 symlog
-    distance = where(distance < 1e-8, 0, distance)  # 미세 노이즈는 0
-    return -distance.sum(축 ≥ 2)
-```
-
-- `self._mode`는 raw logits (Linear 출력) — 이미 symlog 공간의 값으로 학습됨.
-- `mode()` / `mean()` = `symexp(self._mode)` → 추론 시 원래 스케일 복원.
-- agg='sum': 마지막 차원들을 모두 합. shape `[B, T, D]`면 D를 합쳐 `[B, T]` loss.
-- 분포가 아니라 **deterministic predictor + MSE loss**의 클래스 포장. `log_prob`이 가우시안 log-prob의 -MSE 항만 남기고 정규화 상수와 표준편차를 제거한 형태.
-- `tol=1e-8`: float16 AMP에서 underflow로 NaN 발생 방지. 일반 학습에서는 거의 안 걸림.
-
-### 2-4. `MSEDist` — image reconstruction ([tools.py:509-529](../../../dreamerv3-torch/tools.py#L509-L529))
-
-`SymlogDist`에서 symlog만 뺀 것. image_dist 기본값.
-
-```python
-log_prob(value) = -((mode - value)**2).sum(축 ≥ 2)
-```
-- 이미지는 `[B, T, H, W, C]` — 축 2,3,4를 합쳐 `[B, T]` loss.
-- 이미지는 이미 `[-0.5, 0.5]`로 정규화된 후라 symlog 불필요.
-
-### 2-5. `OneHotDist` — straight-through 카테고리 ([tools.py:425-449](../../../dreamerv3-torch/tools.py#L425-L449))
-
-`torch.distributions.OneHotCategorical` 상속. RSSM stoch (discrete), actor (discrete action)에 사용.
-
-#### unimix
-```python
-if unimix_ratio > 0:
-    probs = softmax(logits)
-    probs = probs*(1-α) + α/K        # 균등 1%(=0.01) 혼합
-    logits = log(probs)              # 다시 로그로 (super().__init__이 logits 받음)
-```
-- α=0.01: 모든 카테고리에 최소 0.01/K 확률 보장 → 0 확률로 인한 log(0)·dead exploration 방지.
-- 0이 되지 않으므로 KL divergence도 안정.
-
-#### Straight-through estimator
-```python
-def sample(self, ...):
-    sample = super().sample(...).detach()    # one-hot (gradient 끊김)
-    probs = super().probs
-    sample += probs - probs.detach()         # ★ forward: one-hot, backward: probs
-    return sample
-
-def mode(self):
-    _mode = F.one_hot(argmax(logits))
-    return _mode.detach() + logits - logits.detach()    # 같은 트릭
-```
-
-- `a + b - b.detach()`: forward 값은 `a + 0 = a` (one-hot), backward gradient는 `b`의 것(probs). PyTorch의 STE 표준 패턴.
-- 이 트릭 덕분에 discrete RSSM stoch에 backprop이 흐른다 (path gradient).
-
-#### RSSM에서의 wrapping
-`OneHotDist(logit, unimix=0.01)` 자체는 `[..., 32, 32]` 카테고리 1개. RSSM은 [networks.py:246-247](../../../dreamerv3-torch/networks.py#L246-L247)에서 `torchd.independent.Independent(dist, 1)`로 마지막 32-그룹을 독립으로 reinterpret → **KL이 32개 카테고리의 KL 합**으로 계산됨. `log_prob`도 32개 합. 이 wrapping이 없으면 32×32를 단일 큰 카테고리로 보게 되어 의도와 어긋남.
-
-### 2-6. `ContDist` — continuous actor 래퍼 ([tools.py:564-590](../../../dreamerv3-torch/tools.py#L564-L590))
-
-`Normal` 또는 `Independent(Normal, k)`를 감싸 `absmax` 제약 추가.
-
-```python
-def mode(self):
-    out = self._dist.mean
-    if absmax is not None:
-        out *= (absmax / clip(|out|, min=absmax)).detach()    # |out| > absmax이면 스케일 다운
-    return out
-```
-
-- `absmax=1.0` (ImagBehavior actor) → 액션이 [-1, 1] 박스 밖으로 나가는 걸 부드럽게 제한. `tanh`보다 약한 클리핑.
-- detach: 클리핑 자체에 gradient가 흐르지 않게.
-- `sample`은 `rsample` 사용 → reparameterization gradient 가능.
-
-### 2-7. `Bernoulli` — cont head ([tools.py:593-617](../../../dreamerv3-torch/tools.py#L593-L617))
-
-continue 확률(에피소드 종료 안 함)을 예측. `torch.distributions.Bernoulli` 래퍼.
-
-```python
-def mode(self):
-    _mode = torch.round(self._dist.mean)            # 0 or 1
-    return _mode.detach() + mean - mean.detach()    # STE
-
-def log_prob(self, x):
-    _logits = self._dist.base_dist.logits
-    log_p0 = -softplus(logits)
-    log_p1 = -softplus(-logits)
-    return (log_p0*(1-x) + log_p1*x).sum(-1)        # numerically stable BCE
-```
-
-- `softplus` 기반 BCE — 직접 `log(p)·x + log(1-p)·(1-x)` 하면 logits가 클 때 overflow. 이 형태는 항상 안정.
-- `.mean`은 Bernoulli이라 = `sigmoid(logits)` = 확률. 그래서 `_compute_target`의 `cont_head(inp).mean`이 discount 계수가 된다 (§1-5 참조).
-
-### 2-8. `UnnormalizedHuber` ([tools.py:620-631](../../../dreamerv3-torch/tools.py#L620-L631))
-
-```python
-log_prob(event) = -(√((event - μ)² + threshold²) - threshold)
-```
-- pseudo-Huber loss. threshold=1에서 작은 오차 ≈ 0.5·err², 큰 오차 ≈ |err| - 0.5.
-- Normal log-prob처럼 쓸 수 있는 robust loss. 기본 config에서는 거의 안 쓰임 (옵션).
-
-### 2-9. `SafeTruncatedNormal`, `TanhBijector`, `SampleDist`
-
-- **`SafeTruncatedNormal`** ([L634-649](../../../dreamerv3-torch/tools.py#L634-L649)): `trunc_normal` actor 선택 시. sample 후 `[low+ε, high-ε]`로 STE clip. `_mult`로 액션 스케일 조정.
-- **`TanhBijector`** ([L652-668](../../../dreamerv3-torch/tools.py#L652-L668)): SAC식 `tanh_normal` actor. inverse에서 ±1 근처 NaN 방지 clamp.
-- **`SampleDist`** ([L398-422](../../../dreamerv3-torch/tools.py#L398-L422)): tanh_normal 같이 analytic mean/mode가 없는 분포용. N=100 샘플로 mean·mode·entropy 추정. 기본 config는 안 씀.
-
-### 2-10. 분포-head 매핑 한눈에
-
-| Head | 분포 class | dist 이름 | log_prob target | mode 출력 |
-|---|---|---|---|---|
-| **image decoder** | `MSEDist` | `mse` | raw pixel | raw + 0.5 |
-| **vector decoder** | `SymlogDist` | `symlog_mse` | symlog(target) | symexp(logits) |
-| **reward head** | `DiscDist` | `symlog_disc` | twohot(symlog(r), 255 bin) | symexp(Σ p·b) |
-| **value head** | `DiscDist` | `symlog_disc` | twohot(symlog(V), 255 bin) | symexp(Σ p·b) |
-| **cont head** | `Bernoulli` | `binary` | BCE(continue) | round + STE |
-| **RSSM stoch (discrete)** | `Independent(OneHotDist, 1)` | — | KL between post/prior | one-hot + STE |
-| **RSSM stoch (continuous)** | `ContDist(Independent(Normal,1))` | — | KL Normal | mean (clipped) |
-| **actor (continuous)** | `ContDist(Independent(Normal,1))`, `tanh(mean)` | `normal` | log Normal | tanh(mean), absmax=1 |
-| **actor (discrete)** | `OneHotDist` | `onehot` | log onehot | argmax + STE |
-
-### 2-11. 학습 신호 흐름 with 분포
-
-```
-data["image"]    ←→  MSEDist        ← decoder image head
-data[vec_key]    ←→  SymlogDist     ← decoder vector head (symlog target)
-data["reward"]   ←→  DiscDist       ← reward head (twohot symlog 255 bin)
-data["cont"]     ←→  Bernoulli      ← cont head (1-is_terminal)
-post.stoch       ←→  OneHotDist KL  ← prior.stoch       (representation/dynamics loss)
-
-imagination:
-  prior.stoch    ← OneHotDist.sample (STE)
-  actor          ← ContDist|OneHotDist.sample (STE for onehot, rsample for cont)
-  reward         ← DiscDist.mode() = symexp 복원 (원래 스케일 reward)
-  value          ← DiscDist.mode()
-  cont           ← Bernoulli.mean = sigmoid (soft discount)
-  target(λ-ret)  ← DiscDist.log_prob (value 학습 시, twohot)
-```
-
-### 2-12. 설계 포인트
-
-1. **회귀 → 분류 변환 (twohot DiscDist)**: reward·value 스케일이 환경마다 천차만별이라 가우시안 회귀는 분산 튜닝이 필요. 255-bin twohot은 분산 hyperparameter를 제거하면서 분포적 표현을 유지.
-2. **symlog 공간에서 분류**: bucket이 symlog의 [-20, 20] → 원래 스케일 ±4.85e8까지 단일 hyperparameter로 커버. **Dreamer-v3가 모든 환경에서 같은 config로 도는 핵심.**
-3. **STE 일관성**: OneHotDist (RSSM stoch, discrete action), Bernoulli (cont head) 모두 같은 `a.detach() + b - b.detach()` 패턴. forward는 hard, backward는 soft.
-4. **unimix 0.01**: discrete categorical의 모든 곳(RSSM stoch, discrete actor)에 적용. 0 probability 회피.
-5. **SymlogDist는 진짜 분포가 아님**: log_prob이 -MSE에 symlog target만 더한 형태. 정규화 상수 없는 "loss 함수의 분포 인터페이스 래핑". MSE/Huber가 그렇듯 maximum likelihood ≠ scale-aware.
-6. **`ContDist.absmax`**: tanh-saturation 없이 부드럽게 액션 박스 제약. mean의 gradient는 살리되 크기만 detach.
-7. **out-of-range는 clip**: DiscDist twohot이 [-20, 20] 밖이면 끝 bin에 몰림 → 발산 시에도 학습이 무너지지 않음. 안전장치.
-8. **`Independent(OneHotDist, 1)` wrapping**: 32×32 latent에서 32개 카테고리를 독립적으로 보게 만들어 KL이 합 형태로 계산되게 함. RSSM의 `get_dist`에서만 적용 ([networks.py:246-247](../../../dreamerv3-torch/networks.py#L246-L247)).
+1. **AMP 정석 패턴**: scale → backward → unscale → clip → step → update. PyTorch 공식 권장 순서.
+2. **gradient inf/nan 자동 스킵**: `scaler.step`이 unscale된 grad에 inf/nan 있으면 step skip + scale 감소. RL의 비정상 loss에 강함.
+3. **decoupled WD 직접 구현**: AdamW를 안 쓰고 직접 `var *= (1-wd)`. JAX 원본과 동등 동작 보존을 위한 선택으로 추정.
+4. **`retain_graph=True`** 디폴트: ImagBehavior가 actor·value 두 lane backward 필요 — 안전한 디폴트.
+5. **`assert` 입력 검증**: wd ∈ [0, 1), clip ≥ 1 — hyperparameter 실수 차단.
 
 ---
 
-## 3. 다음 세션이 바로 시작할 작업 (7단계: Exploration)
+## 5. 손실 흐름 한눈에
 
-### 분석 항목 (`exploration.py` 135줄)
-1. **`Random`** — uniform action 베이스라인. 어떤 분포(actor와 같은 분포?)를 쓰는지, `_train`이 no-op인지.
-2. **`Plan2Explore`** —
-   - **one_step ensemble**: 몇 개 head(`disag_models`)를 어떤 입력으로 학습시키는지. target은 next embed인가 next stoch인가.
-   - **disagreement reward**: ensemble의 예측 분산(variance / std)을 어떤 reduction으로 스칼라화하는지.
-   - **ImagBehavior reuse**: `Plan2Explore`가 내부에 별도 `ImagBehavior`를 두고 그 `objective`에 disagreement를 람다로 주입하는 구조 확인.
-3. **`dreamer.py`에서 `_expl_behavior` 호출** — `config.expl_behavior`(`'greedy'`/`'random'`/`'plan2explore'`) 분기, 학습 시점, eval 시 사용 여부.
-4. **`expl_amount`/`expl_until`/`expl_decay`** — 가능한 ε-greedy 비슷한 스케줄 있는지 ([dreamer.py](../../../dreamerv3-torch/dreamer.py) `_policy` 함수에서 확인).
+```
+                                  ─── WorldModel._train ───
+obs(dict) ──┬─ excluded 제거 ─┬─ cnn keys → ConvEncoder ──┐
+            │                  └─ mlp keys → MLP(symlog) ──┴─→ embed [B, T, E]
+            └─ action ─────────────────────────────────────────────────┐
+                                                                       │
+embed + action + is_first ─→ RSSM.observe ─→ post, prior ──────────────┤
+                                                  │                    │
+                                                  ├─→ decoder(get_feat(post))  → image_dist (MSE) / vector_dist (SymlogDist)
+                                                  ├─→ reward(get_feat(post))   → DiscDist (twohot symlog 255-bin)
+                                                  ├─→ cont(get_feat(post))     → Bernoulli (binary)
+                                                  └─→ KL(post||prior) ─→ dyn_loss·0.5 + rep_loss·0.1, kl_free=1.0
+                                                  ─── sum + kl ──→ _model_opt (Adam + AMP + clip=1000)
 
-### 작업 흐름 (권장)
-1. `exploration.py` 전체 정독.
-2. `dreamer.py`에서 `_expl_behavior`, `expl_*` 키워드로 호출 흐름 추적.
-3. `models.py`의 `WorldModel.heads`에 `disag` head가 추가되는지(있다면 어디서), 없다면 Plan2Explore 내부에서 ensemble을 별도로 가지는지 확인.
-4. 본 문서 동일 형식으로 정리(섹션 헤더, 표, 코드 블록, [파일:라인](링크)).
-5. 사용자에게 결과 보고 → "006 문서로 저장" 요청 받으면 `006-dreamer_code_analysis_part4.md` 생성.
+post(detach) ─→ ImagBehavior._imagine(actor, H=15) ─→ (imag_feat, imag_state, imag_action) [H, N=B·T, ...]
+                                                       │
+                                                       ├─→ objective(feat, state, action) ──→ reward [H, N, 1]   (heads['reward'].mode())
+                                                       ├─→ heads['cont'](feat).mean ─────────→ continue prob → discount = γ · cont
+                                                       ├─→ value(imag_feat).mode() ──────────→ V [H, N, 1]
+                                                       └─→ tools.lambda_return(r[1:], V[:-1], γ[1:], bootstrap=V[-1], λ=0.95)
+                                                              └─→ tuple of N, each [T-1, 1] ─→ stack(dim=1) → target [T-1, N, 1]
+
+  RewardEMA(target) ─→ (offset, scale)
+  normed_target, normed_base
+  adv = normed_target - normed_base
+  actor_target = adv (dynamics) / log π · adv.detach() (reinforce) / mix (both)
+  actor_loss = -weights[:-1] · actor_target - entropy · actor_ent[:-1]
+            ─────────────────────────────────────────────→ _actor_opt (Adam, lr=3e-5, clip=100)
+
+  value(imag_feat[:-1].detach()) ──→ value_loss = -log_prob(target.detach())
+                                                  - log_prob(slow_value(imag_feat[:-1]).mode())   (slow self-distill)
+  value_loss = mean(weights[:-1] · value_loss)
+            ─────────────────────────────────────────────→ _value_opt (Adam, lr=3e-5, clip=100)
+                                                                                  ↑
+                                                              _slow_value (polyak τ=0.02, 매 step)
+```
 
 ---
 
-## 4. 컨벤션 재확인
+## 6. 설계 포인트 (통합)
 
-- `_thinking/`은 append-only. 기존 문서 절대 수정 금지.
-- 명시적 "N 문서로 저장" 요청 있을 때만 새 파일 작성.
-- 파일 이름은 `NNN-dreamer_code_analysis_partK.md` 형식.
-- 한글 응답.
-- "진행해" = 다음 단계 진행.
-- 분석 대상은 **dreamer-v3 코드 자체**. F1TENTH 통합 얘기 섞지 말 것.
+1. **3개 옵티마이저** (model / actor / value) — 그래디언트 흐름 격리. 각 lane의 backward가 서로 영향 없도록 detach 위치를 신중히 배치.
+2. **단일 forward에서 모든 head 손실 계산** — 효율적. `image` 키 하드코딩이 비전 환경 가정.
+3. **KL balancing** (dyn 0.5 / rep 0.1) — Dreamer-v3가 v2 대비 가장 크게 바뀐 곳 중 하나.
+4. **continue head로 discount 변조** — 종료 가까운 state 자동 절하.
+5. **symlog_disc로 reward/value 표현** — 분포가 넓은 reward 안정 학습 ([004 §1-2](004-dreamer_code_analysis_part2.md#1-2-discdist--twohot-인코딩-categorical-toolspy452-506)).
+6. **reward EMA + 5/95 quantile** — 환경별 reward scaling 자동화. actor lane만.
+7. **slow value self-distill** — value loss에 두 항 더하기 트릭.
+8. **path-derivative(dynamics) vs REINFORCE** 분기 — continuous는 path-grad가 분산 낮음, discrete는 REINFORCE.
+9. **AMP + grad clip + decoupled WD** — Optimizer 래퍼가 정석 패턴 강제.
+10. **`retain_graph=True`** — actor·value 두 lane backward 가능.
+
+---
+
+## 7. 다음 단계 안내
+
+7~9단계: **Exploration + 데이터 + 포팅 + 평가** — [006](006-dreamer_code_analysis_part4.md).
+
+확인 항목:
+- `Random`/`Plan2Explore` — ensemble disagreement 보너스, ImagBehavior 재사용 구조, `_intrinsic_reward` 자기강화 위험.
+- 데이터 파이프라인 — `load_episodes`, `sample_episodes` (시드 결정성, is_first 강제), `from_generator`, `simulate`, `add_to_cache`, `save_episodes`(BytesIO), `erase_over_episodes`/`dataset_size`, `Every`/`Once`/`Until` 카운터.
+- JAX→PyTorch 포팅 — `static_scan`, `Conv2dSamePad`, `ImgChLayerNorm`, `weight_init`/`uniform_weight_init`, `GRUCell` 3-gate 합성.
+- 평가·체크포인트 — eval rollout, `video_pred` (본 문서 §1-5에서 다룸, 평가용 호출 흐름은 006), `latest.pt` 단일 파일 정책, resume 시드 결정성, `recursively_collect/load_optim_state_dict`.
+
+---
+
+## 8. 컨벤션
+
+- 한국어 응답.
+- 코드 인용은 줄 링크만. 코드 블록 발췌 금지.
+- 분석 대상은 **dreamer-v3 코드 자체**. F1TENTH 통합 코멘트 금지.
+- 본 감사 작업 한정으로 직접 수정 허용 (1회 예외).

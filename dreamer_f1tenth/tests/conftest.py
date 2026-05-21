@@ -9,6 +9,7 @@ for p in (
     _PROJECT_ROOT,
     os.path.join(_PROJECT_ROOT, "gym"),
     os.path.join(_PROJECT_ROOT, "pkg", "src"),
+    os.path.join(_PROJECT_ROOT, "vendor", "dreamerv3-torch"),
 ):
     if p not in sys.path:
         sys.path.insert(0, p)

@@ -1,0 +1,61 @@
+### diff models.py ###
+--- /home/dlacksdn/dreamerv3-torch/models.py	2026-05-20 00:13:13.780127276 +0900
++++ vendor/dreamerv3-torch/models.py	2026-05-21 18:35:41.321252729 +0900
+@@ -179,7 +179,8 @@
+             k: torch.tensor(v, device=self._config.device, dtype=torch.float32)
+             for k, v in obs.items()
+         }
+-        obs["image"] = obs["image"] / 255.0
++        if "image" in obs:  # f1tenth fork-patch (#14, A20): vector-only obs has no image key
++            obs["image"] = obs["image"] / 255.0
+         if "discount" in obs:
+             obs["discount"] *= self._config.discount
+             # (batch_size, batch_length) -> (batch_size, batch_length, 1)
+### diff dreamer.py ###
+--- /home/dlacksdn/dreamerv3-torch/dreamer.py	2026-05-20 00:13:13.760584051 +0900
++++ vendor/dreamerv3-torch/dreamer.py	2026-05-21 18:42:02.221250929 +0900
+@@ -193,6 +193,11 @@
+ 
+         env = minecraft.make_env(task, size=config.size, break_speed=config.break_speed)
+         env = wrappers.OneHotAction(env)
++    elif suite == "f1tenth":  # f1tenth fork-patch (decision #22/#25, Phase 2-0)
++        from envs.f1tenth import F1Tenth
++
++        env = F1Tenth(task, config.action_repeat, seed=config.seed + id)
++        env = wrappers.NormalizeActions(env)
+     else:
+         raise NotImplementedError(suite)
+     env = wrappers.TimeLimit(env, config.time_limit)
+### diff configs.yaml ###
+--- /home/dlacksdn/dreamerv3-torch/configs.yaml	2026-05-20 00:13:13.760584051 +0900
++++ vendor/dreamerv3-torch/configs.yaml	2026-05-21 18:43:20.005236679 +0900
+@@ -182,3 +182,28 @@
+   prefill: 1
+   batch_size: 10
+   batch_length: 20
++
++f1tenth:
++  # Phase 2-0 SKELETON (decision #22/#25; 007 fixed-HP fidelity §2-B; 008 snapshot).
++  # The model / encoder-decoder / 12M + lidar_keys section is finalized in
++  # Phase 2-3 (A9/A10), after ConvEncoder1D (2-1) and the MultiEncoder lidar
++  # branch (2-2) land. Algorithm HPs (dyn_scale/kl_free/lr/train_ratio/...) are
++  # left at `defaults` per 007 §2-A (no override).
++  task: 'f1tenth_map_easy3'        # decision #25; Stage 2 -> 'f1tenth_Oschersleben'
++  # --- episode / accounting (decision #22) ---
++  action_repeat: 2                 # adapter owns the repeat loop; dreamer.py divides counters by this
++  time_limit: 18000                # main: //action_repeat -> TimeLimit=9000 env-step = 180s @ 50/s
++  steps: 5e5                       # v3 §2-3; //action_repeat in main. final budget pending A19 dry-run
++  envs: 1
++  parallel: False                  # Damy wrapper (parallel.py)
++  prefill: 0                       # decision #23 (GapFollower collector is separate)
++  # --- compute/memory profile (007 §2-B, 8GB) ---
++  precision: 16                    # 8GB AMP
++  compile: False                   # decision #26 (ConvEncoder1D dynamic padding)
++  batch_size: 8
++  batch_length: 64
++  dataset_size: 200000             # F5-14 (+ LiDAR fp16 in Phase 3)
++  # --- eval (decision #19) ---
++  eval_episode_num: 20
++  eval_state_mean: True
++  video_pred_log: False            # decision #14 (vector-only obs; video_pred hardcodes image key)
+--- f1tenth.py is NEW (no upstream) ---

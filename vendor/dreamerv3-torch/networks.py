@@ -10,6 +10,26 @@ from torch import distributions as torchd
 import tools
 
 
+def _import_lidar_nets():
+    """f1tenth fork-patch (#5/#16): lazy import of the project's 1D LiDAR nets.
+
+    Imported lazily (only when a lidar_keys branch is active) so non-f1tenth
+    suites never need the project package on path. Ensures the project root is
+    importable: vendor/dreamerv3-torch/networks.py -> up 3 = project root.
+    """
+    import os
+    import sys
+
+    root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from dreamer_f1tenth.networks_1d import ConvEncoder1D, ConvDecoder1D
+
+    return ConvEncoder1D, ConvDecoder1D
+
+
 class RSSM(nn.Module):
     def __init__(
         self,
@@ -304,6 +324,9 @@ class MultiEncoder(nn.Module):
         mlp_layers,
         mlp_units,
         symlog_inputs,
+        lidar_keys="$^",          # f1tenth fork-patch (#5/#16, A8): 1D LiDAR conv path
+        lidar_units=512,          # ConvEncoder1D projection dim (#16)
+        device="cuda",            # forwarded to MLP (CPU shape tests pass 'cpu')
     ):
         super(MultiEncoder, self).__init__()
         excluded = ("is_first", "is_last", "is_terminal", "reward")
@@ -315,12 +338,20 @@ class MultiEncoder(nn.Module):
         self.cnn_shapes = {
             k: v for k, v in shapes.items() if len(v) == 3 and re.match(cnn_keys, k)
         }
+        # f1tenth: 1-D keys matching lidar_keys go to ConvEncoder1D (take precedence
+        # over the MLP path so a lidar key is never double-routed).
+        self.lidar_shapes = {
+            k: v for k, v in shapes.items() if len(v) == 1 and re.match(lidar_keys, k)
+        }
         self.mlp_shapes = {
             k: v
             for k, v in shapes.items()
-            if len(v) in (1, 2) and re.match(mlp_keys, k)
+            if len(v) in (1, 2)
+            and re.match(mlp_keys, k)
+            and k not in self.lidar_shapes
         }
         print("Encoder CNN shapes:", self.cnn_shapes)
+        print("Encoder LIDAR shapes:", self.lidar_shapes)
         print("Encoder MLP shapes:", self.mlp_shapes)
 
         self.outdim = 0
@@ -331,6 +362,16 @@ class MultiEncoder(nn.Module):
                 input_shape, cnn_depth, act, norm, kernel_size, minres
             )
             self.outdim += self._cnn.outdim
+        if self.lidar_shapes:
+            ConvEncoder1D = _import_lidar_nets()[0]
+            assert len(self.lidar_shapes) == 1, (
+                f"multiple lidar keys unsupported: {list(self.lidar_shapes)}"
+            )
+            (lidar_len,) = list(self.lidar_shapes.values())[0]
+            self._lidar = ConvEncoder1D(
+                input_len=lidar_len, out_dim=lidar_units, act=act, norm=norm
+            )
+            self.outdim += self._lidar.outdim
         if self.mlp_shapes:
             input_size = sum([sum(v) for v in self.mlp_shapes.values()])
             self._mlp = MLP(
@@ -341,6 +382,7 @@ class MultiEncoder(nn.Module):
                 act,
                 norm,
                 symlog_inputs=symlog_inputs,
+                device=device,
                 name="Encoder",
             )
             self.outdim += mlp_units
@@ -350,6 +392,9 @@ class MultiEncoder(nn.Module):
         if self.cnn_shapes:
             inputs = torch.cat([obs[k] for k in self.cnn_shapes], -1)
             outputs.append(self._cnn(inputs))
+        if self.lidar_shapes:  # concat order [cnn, lidar, mlp] (#16: [lidar, mlp])
+            (key,) = list(self.lidar_shapes)
+            outputs.append(self._lidar(obs[key]))
         if self.mlp_shapes:
             inputs = torch.cat([obs[k] for k in self.mlp_shapes], -1)
             outputs.append(self._mlp(inputs))
@@ -375,6 +420,8 @@ class MultiDecoder(nn.Module):
         image_dist,
         vector_dist,
         outscale,
+        lidar_keys="$^",          # f1tenth fork-patch (#5/#16, A8): 1D LiDAR conv path
+        device="cuda",            # forwarded to MLP (CPU shape tests pass 'cpu')
     ):
         super(MultiDecoder, self).__init__()
         excluded = ("is_first", "is_last", "is_terminal")
@@ -382,12 +429,18 @@ class MultiDecoder(nn.Module):
         self.cnn_shapes = {
             k: v for k, v in shapes.items() if len(v) == 3 and re.match(cnn_keys, k)
         }
+        self.lidar_shapes = {
+            k: v for k, v in shapes.items() if len(v) == 1 and re.match(lidar_keys, k)
+        }
         self.mlp_shapes = {
             k: v
             for k, v in shapes.items()
-            if len(v) in (1, 2) and re.match(mlp_keys, k)
+            if len(v) in (1, 2)
+            and re.match(mlp_keys, k)
+            and k not in self.lidar_shapes
         }
         print("Decoder CNN shapes:", self.cnn_shapes)
+        print("Decoder LIDAR shapes:", self.lidar_shapes)
         print("Decoder MLP shapes:", self.mlp_shapes)
 
         if self.cnn_shapes:
@@ -404,6 +457,20 @@ class MultiDecoder(nn.Module):
                 outscale=outscale,
                 cnn_sigmoid=cnn_sigmoid,
             )
+        if self.lidar_shapes:
+            ConvDecoder1D = _import_lidar_nets()[1]
+            assert len(self.lidar_shapes) == 1, (
+                f"multiple lidar keys unsupported: {list(self.lidar_shapes)}"
+            )
+            (lidar_len,) = list(self.lidar_shapes.values())[0]
+            self._lidar = ConvDecoder1D(
+                feat_size,
+                output_len=lidar_len,
+                act=act,
+                norm=norm,
+                outscale=outscale,
+                dist=vector_dist,
+            )
         if self.mlp_shapes:
             self._mlp = MLP(
                 feat_size,
@@ -414,6 +481,7 @@ class MultiDecoder(nn.Module):
                 norm,
                 vector_dist,
                 outscale=outscale,
+                device=device,
                 name="Decoder",
             )
         self._image_dist = image_dist
@@ -431,6 +499,9 @@ class MultiDecoder(nn.Module):
                     for key, output in zip(self.cnn_shapes.keys(), outputs)
                 }
             )
+        if self.lidar_shapes:
+            (key,) = list(self.lidar_shapes)
+            dists[key] = self._lidar(features)
         if self.mlp_shapes:
             dists.update(self._mlp(features))
         return dists

@@ -207,3 +207,7 @@ f1tenth:
   eval_episode_num: 20
   eval_state_mean: True
   video_pred_log: False            # decision #14 (vector-only obs; video_pred hardcodes image key)
+  # --- encoder/decoder key routing (Phase 2-2, A8). model dims (mlp_units, 12M)
+  #     finalized in Phase 2-3; these dicts merge over `defaults` key-wise. ---
+  encoder: {lidar_keys: 'lidar', mlp_keys: 'state', cnn_keys: '$^', symlog_inputs: False}  # #15
+  decoder: {lidar_keys: 'lidar', mlp_keys: 'state', cnn_keys: '$^', vector_dist: symlog_mse}

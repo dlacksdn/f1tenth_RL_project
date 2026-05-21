@@ -33,7 +33,9 @@ class WorldModel(nn.Module):
         self._use_amp = True if config.precision == 16 else False
         self._config = config
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
-        self.encoder = networks.MultiEncoder(shapes, **config.encoder)
+        # device forwarded so MultiEncoder/MultiDecoder MLPs match config.device
+        # (upstream left them at MLP's "cuda" default -> CPU instantiate failed).
+        self.encoder = networks.MultiEncoder(shapes, **config.encoder, device=config.device)
         self.embed_size = self.encoder.outdim
         self.dynamics = networks.RSSM(
             config.dyn_stoch,
@@ -58,7 +60,7 @@ class WorldModel(nn.Module):
         else:
             feat_size = config.dyn_stoch + config.dyn_deter
         self.heads["decoder"] = networks.MultiDecoder(
-            feat_size, shapes, **config.decoder
+            feat_size, shapes, **config.decoder, device=config.device
         )
         self.heads["reward"] = networks.MLP(
             feat_size,

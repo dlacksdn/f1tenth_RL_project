@@ -189,7 +189,7 @@ f1tenth:
   # Phase 2-3 (A9/A10), after ConvEncoder1D (2-1) and the MultiEncoder lidar
   # branch (2-2) land. Algorithm HPs (dyn_scale/kl_free/lr/train_ratio/...) are
   # left at `defaults` per 007 §2-A (no override).
-  task: 'f1tenth_map_easy3'        # decision #25; Stage 2 -> 'f1tenth_Oschersleben'
+  task: 'f1tenth_map_easy3'        # decision #25/#32: TRAIN on map_easy3 ONLY. Oschersleben is held-out (NEVER trained); zero-shot eval via separate eval config/CLI override only (planning/011).
   # --- episode / accounting (decision #22) ---
   action_repeat: 2                 # adapter owns the repeat loop; dreamer.py divides counters by this
   time_limit: 18000                # main: //action_repeat -> TimeLimit=9000 env-step = 180s @ 50/s
@@ -200,7 +200,7 @@ f1tenth:
   # --- compute/memory profile (007 §2-B, 8GB) ---
   precision: 16                    # 8GB AMP
   compile: False                   # decision #26 (ConvEncoder1D dynamic padding)
-  batch_size: 8
+  batch_size: 16                   # A19 dry-run 정정 (notes/dryrun_results.md): VRAM 3.3GB/8GB 여유 + Every(1024/512)=2 = dreamerv3 의도 replay ratio 복원(batch8은 매-step train=2배 over-training, 007 fixed-HP 위반). 단일500K 20.9h<24h PASS.
   batch_length: 64
   dataset_size: 200000             # F5-14 (+ LiDAR fp16 in Phase 3)
   # --- eval (decision #19) ---

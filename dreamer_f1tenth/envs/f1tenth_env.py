@@ -27,6 +27,7 @@ from f110_gym.envs.f110_env import F110Env
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _PKG_MAPS = os.path.join(_PROJECT_ROOT, "pkg", "src", "pkg", "maps")
+_MAPS_DIR = os.path.join(_PROJECT_ROOT, "maps")  # centerline csv (implementation/002)
 
 # Vehicle/action bounds — f110_env default params.
 S_MIN, S_MAX = -0.4189, 0.4189
@@ -53,14 +54,33 @@ TRACK_CONFIGS = {
         "map_ext": ".png",
         "default_pose": np.array([8.620, 11.860, 2.356], dtype=np.float32),
         "L_track": 117.22,
+        "centerline_csv": os.path.join(_MAPS_DIR, "map_easy3_centerline.csv"),
     },
     "Oschersleben": {
         "map_path": os.path.join(_PKG_MAPS, "Oschersleben"),
         "map_ext": ".png",
         "default_pose": np.array([0.0702245, 0.3002981, 2.79787], dtype=np.float32),
         "L_track": 312.61,
+        "centerline_csv": os.path.join(_MAPS_DIR, "Oschersleben_centerline.csv"),
     },
 }
+
+# reverse_guard (v3 §3 1-4, §4-3 line 318, decision #8/#24).
+# centerline tangent · vehicle world-frame velocity < 0 (후진) 가 연속
+# REVERSE_COUNTER_LIMIT env step 지속 시 terminated, cause='reverse'.
+REVERSE_COUNTER_LIMIT = 50  # 50 env step = 1s @ action_repeat=2 (50 env step/s)
+
+
+def _load_centerline(csv_path):
+    """centerline csv (header s,x,y,tx,ty) → (xy (N,2) f32, tangent (N,2) f32)."""
+    arr = np.loadtxt(csv_path, delimiter=",", skiprows=1, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[1] != 5:
+        raise ValueError(
+            f"centerline csv {csv_path!r} expected (N,5) s,x,y,tx,ty; got {arr.shape}"
+        )
+    xy = np.ascontiguousarray(arr[:, 1:3])       # (N,2)
+    tangent = np.ascontiguousarray(arr[:, 3:5])  # (N,2) unit tangent
+    return xy, tangent
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +118,11 @@ class F110GymnasiumWrapper(gymnasium.Env):
             else cfg["default_pose"].copy()
         )
 
+        # centerline for reverse_guard (v3 §3 1-4). xy (N,2), unit tangent (N,2).
+        self._centerline_xy, self._centerline_tangent = _load_centerline(
+            cfg["centerline_csv"]
+        )
+
         self._env = F110Env(
             map=cfg["map_path"],
             map_ext=cfg["map_ext"],
@@ -126,6 +151,7 @@ class F110GymnasiumWrapper(gymnasium.Env):
         self._prev_steer = 0.0
         self._prev_speed = 0.0
         self._first_step_done = False
+        self._reverse_counter = 0
         self._raw_obs = None
 
     # ------------------------------------------------------------------
@@ -175,6 +201,7 @@ class F110GymnasiumWrapper(gymnasium.Env):
         self._prev_steer = 0.0
         self._prev_speed = 0.0
         self._first_step_done = False
+        self._reverse_counter = 0
         self._raw_obs = raw
 
         obs = self._build_obs(raw, is_first=True, is_terminal=False, is_last=False)
@@ -205,7 +232,30 @@ class F110GymnasiumWrapper(gymnasium.Env):
 
         lap_count = int(raw["lap_counts"][0])
 
-        # Termination priority: collision > reverse(stub) > lap_complete > timeout.
+        # reverse_guard (v3 §3 1-4, decision #8/#24): centerline tangent · world-frame
+        # velocity < 0 (후진) 가 REVERSE_COUNTER_LIMIT env step 연속 지속 시 종료.
+        # dot ≥ 0 (전진·정지) 이면 카운터 reset.
+        pos = np.array([raw["poses_x"][0], raw["poses_y"][0]], dtype=np.float32)
+        yaw = float(raw["poses_theta"][0])
+        vel_x = float(raw["linear_vels_x"][0])  # body-frame longitudinal
+        vel_y = float(raw["linear_vels_y"][0])  # body-frame lateral (#27 patch)
+        cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+        vel_world = np.array(
+            [vel_x * cos_y - vel_y * sin_y, vel_x * sin_y + vel_y * cos_y],
+            dtype=np.float32,
+        )
+        closest_idx = int(np.argmin(((self._centerline_xy - pos) ** 2).sum(axis=1)))
+        dot = float(vel_world @ self._centerline_tangent[closest_idx])
+        # vel_x<0 (참 후진, body-frame longitudinal state[3]<0) AND dot<0 동시 충족 시만 카운트.
+        # vel_x<0 gate는 centerline 오정합(implementation/007: Oschersleben centerline mis-
+        # registration) 대비 robust 안전장치 — GF 등 전진(vel_x>0) 정책의 false reverse 방지.
+        # v3 option A의 centerline tangent·velocity dot 조건은 유지(게이팅만 추가).
+        if vel_x < 0.0 and dot < 0.0:
+            self._reverse_counter += 1
+        else:
+            self._reverse_counter = 0
+
+        # Termination priority: collision > reverse > lap_complete > timeout (#24).
         terminated = False
         truncated = False
         cause = None
@@ -214,6 +264,10 @@ class F110GymnasiumWrapper(gymnasium.Env):
         if collision:
             terminated = True
             cause = "collision"
+            is_terminal = True
+        elif self._reverse_counter >= REVERSE_COUNTER_LIMIT:
+            terminated = True
+            cause = "reverse"
             is_terminal = True
         elif lap_count >= 2:
             terminated = True
@@ -237,6 +291,7 @@ class F110GymnasiumWrapper(gymnasium.Env):
             "collision_raw": bool(raw["collisions"][0]),
             "lap_count": lap_count,
             "env_step": self._env_step,
+            "reverse_counter": self._reverse_counter,
             "trackname": self.trackname,
         }
         self._raw_obs = raw

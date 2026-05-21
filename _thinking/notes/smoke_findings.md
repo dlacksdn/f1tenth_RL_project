@@ -13,7 +13,25 @@
 
 → #1/#2/#3 패치 후 스모크가 prefill→agent build→**eval 1ep 통과**(eval_return 로깅, eval_length 231)→training 진입까지 도달.
 
-## 미해결 이슈 (4번) — world model 학습 NaN (~100 update 후 발산)
+## 해결된 이슈 (4번) — world model 학습 NaN → f110 dynamics 발산 (RESOLVED 2026-05-22)
+
+**근본원인 (단계적 진단으로 확정)**:
+1. 순수 WM-train(랜덤데이터 고정 버퍼)은 fp16/fp32·버퍼크기 무관하게 **안정**(diag_wm_nan.py: 300 update 완주, loss 371→6.5). → WM 학습 동역학·AMP·버퍼크기 모두 무죄.
+2. main()/정책-수집 경로(repro_mainloop.py)에서만 ~100 update 후 crash. forward hook으로 **첫 비유한 출력 = `wm.encoder._mlp.layers.Encoder_linear0`(state MLP)** 핀포인트.
+3. 더 추적: `f1tenth_env.py:174 RuntimeWarning: overflow encountered in cast` + 버퍼에 **state=inf 저장**. 즉 **f110 ST dynamics가 수치 발산해 vel_x가 float32 한계(>3.4e38) 초과 → state=inf → 인코더 overflow → RSSM logit inf → OneHotDist ValueError**.
+4. wrapper는 action을 이미 actuator 한계로 clip하는데도 발산 → **f110 dynamics 자체의 수치 불안정**(특정 궤적; 랜덤 탐색은 회피, 학습된 정책의 일관 명령이 도달). symlog_inputs=True도 입력이 이미 inf라 무력(crash 지연만).
+
+**수정 (환경 인터페이스 robustness, HP 아님, 시나리오 무관)**:
+- `f1tenth_env.py` **발산 가드**: step()에서 `|vel|>1e3` 또는 raw(vel/pose/scan) 비유한 감지 → **최우선 종료(cause='diverged', is_terminal)**. `_build_obs`는 `np.nan_to_num` + clip으로 **obs를 항상 finite·bounded 보장**(lidar fp64 경유 정화, state clip ±10). → 버퍼 오염 원천 차단.
+- symlog_inputs는 원인 아님 → #15/#16대로 False 유지(되돌림).
+
+**검증**: repro_mainloop 2000 step / **1100 update 완주 NaN 0**(이전 ~100서 crash). full `dreamer.py main()` smoke 2 사이클 완주 + latest.pt(154MB) 저장 + model_loss ~10-11 안정. pytest 21/21 유지.
+
+**잔여(별도)**: f110 dynamics가 왜 발산하는지(ST 적분 불안정, base_classes.py:488 영역)는 미규명 — 가드로 영향 차단됨. Phase 4 reward에서 'diverged' 종료에 페널티 부여 검토. reward=0 skeleton은 여전(Phase 4 대상).
+
+---
+
+## (구) 미해결 이슈 (4번) — world model 학습 NaN (~100 update 후 발산) [위에서 RESOLVED]
 
 - **증상**: "Start training" 후 `wm.observe → obs_step → get_dist → OneHotDist` logits (16,32,16)에 invalid(NaN/Inf). metrics 보면 **update 100까지 정상**(model_loss=27.4, **model_grad_norm=104**, **lidar_loss=21.4가 지배**, state_loss=0.42, reward_loss=4.2) 후 다음 step에서 발산.
 - **fp16 아님**: precision=32에서도 동일 NaN 재현 → AMP 무관. 학습 안정성/아키텍처 문제.

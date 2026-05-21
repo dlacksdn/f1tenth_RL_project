@@ -47,6 +47,12 @@ DEFAULT_MAX_EP_STEPS = 9000   # 180s @ 50 env step / s
 # - prev_speed / 20       (= v_max)
 _STATE_SCALE = np.array([20.0, 5.0, 2.0 * np.pi, 0.4189, 20.0], dtype=np.float32)
 
+# Divergence guard (f110 ST dynamics numerical blow-up). A velocity above this is
+# physically impossible (v_max=20) -> sim diverged: terminate + sanitize obs.
+_VEL_DIVERGE = 1.0e3          # |vel| beyond this = diverged sim
+_STATE_DIVERGE = 1.0e3        # nan_to_num posinf replacement for raw state
+_STATE_CLIP = 10.0            # final normalized-state clamp (bounds encoder input)
+
 # L_track measured (implementation/002 §2, decision #1 in 004).
 TRACK_CONFIGS = {
     "map_easy3": {
@@ -160,8 +166,12 @@ class F110GymnasiumWrapper(gymnasium.Env):
     # Helpers
     # ------------------------------------------------------------------
     def _build_obs(self, raw, is_first=False, is_terminal=False, is_last=False):
-        lidar = np.asarray(raw["scans"][0], dtype=np.float32)
-        lidar = np.clip(lidar, 0.0, LIDAR_MAX) / LIDAR_MAX
+        lidar = np.asarray(raw["scans"][0], dtype=np.float64)
+        # f110 ST dynamics can numerically diverge (inf/huge) -> non-finite obs
+        # poisons the replay buffer (encoder overflow -> NaN logit). Sanitize so
+        # obs is ALWAYS finite/bounded; the divergence is terminated in step().
+        lidar = np.nan_to_num(lidar, nan=LIDAR_MAX, posinf=LIDAR_MAX, neginf=0.0)
+        lidar = (np.clip(lidar, 0.0, LIDAR_MAX) / LIDAR_MAX).astype(np.float32)
         if lidar.shape[0] != NUM_BEAMS:
             buf = np.ones((NUM_BEAMS,), dtype=np.float32)
             n = min(lidar.shape[0], NUM_BEAMS)
@@ -171,11 +181,12 @@ class F110GymnasiumWrapper(gymnasium.Env):
         vel_x = float(raw["linear_vels_x"][0])
         vel_y = float(raw["linear_vels_y"][0])
         ang_z = float(raw["ang_vels_z"][0])
-        state_raw = np.array(
-            [vel_x, vel_y, ang_z, self._prev_steer, self._prev_speed],
-            dtype=np.float32,
+        state_raw = np.nan_to_num(
+            np.array([vel_x, vel_y, ang_z, self._prev_steer, self._prev_speed],
+                     dtype=np.float64),
+            nan=0.0, posinf=_STATE_DIVERGE, neginf=-_STATE_DIVERGE,
         )
-        state = state_raw / _STATE_SCALE
+        state = np.clip(state_raw / _STATE_SCALE, -_STATE_CLIP, _STATE_CLIP)
 
         return OrderedDict([
             ("lidar", lidar),
@@ -257,13 +268,29 @@ class F110GymnasiumWrapper(gymnasium.Env):
         else:
             self._reverse_counter = 0
 
-        # Termination priority: collision > reverse > lap_complete > timeout (#24).
+        # Divergence guard: f110 ST dynamics can numerically blow up (inf/huge
+        # vel) under sustained valid commands -> non-finite obs would poison the
+        # replay buffer (encoder overflow -> NaN logit, training crash). Detect
+        # and terminate as highest priority; _build_obs sanitizes the obs.
+        diverged = (
+            not np.isfinite([vel_x, vel_y, float(raw["ang_vels_z"][0]),
+                             pos[0], pos[1], yaw]).all()
+            or not np.isfinite(raw["scans"][0]).all()
+            or abs(vel_x) > _VEL_DIVERGE
+            or abs(vel_y) > _VEL_DIVERGE
+        )
+
+        # Termination priority: diverged > collision > reverse > lap_complete > timeout (#24).
         terminated = False
         truncated = False
         cause = None
         is_terminal = False
         is_last = False
-        if collision:
+        if diverged:
+            terminated = True
+            cause = "diverged"
+            is_terminal = True
+        elif collision:
             terminated = True
             cause = "collision"
             is_terminal = True

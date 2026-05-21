@@ -52,15 +52,17 @@ TRACK_CONFIGS = {
     "map_easy3": {
         "map_path": os.path.join(_PKG_MAPS, "map_easy3"),  # f110_env appends .yaml
         "map_ext": ".png",
-        "default_pose": np.array([8.620, 11.860, 2.356], dtype=np.float32),
-        "L_track": 117.22,
+        # ★ on-track green-ribbon pose (implementation/008). 옛 (8.620,11.860,2.356)은
+        # 트랙 밖이라 reset이 개방영역에서 시작했음 → GF DNF 원인. max-clearance 2.37m.
+        "default_pose": np.array([1.02, -14.66, -2.819842], dtype=np.float32),
+        "L_track": 100.57,  # green-ribbon centerline (옛 117.22는 바깥 영역 기준 무효)
         "centerline_csv": os.path.join(_MAPS_DIR, "map_easy3_centerline.csv"),
     },
     "Oschersleben": {
         "map_path": os.path.join(_PKG_MAPS, "Oschersleben"),
         "map_ext": ".png",
         "default_pose": np.array([0.0702245, 0.3002981, 2.79787], dtype=np.float32),
-        "L_track": 312.61,
+        "L_track": 275.18,  # corrected ribbon centerline (옛 312.61은 바깥 루프 무효)
         "centerline_csv": os.path.join(_MAPS_DIR, "Oschersleben_centerline.csv"),
     },
 }

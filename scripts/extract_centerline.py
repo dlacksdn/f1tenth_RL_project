@@ -23,6 +23,18 @@ NOTES_DIR = os.path.join(PROJECT_ROOT, '_thinking', 'notes')
 
 PRIOR_ESTIMATES = {'map_easy3': 70.0, 'Oschersleben': 300.0}
 
+# Start pose (world x, y) ON the drivable track — used to select the track-ribbon
+# free CC (implementation/008). Must match dreamer_f1tenth TRACK_CONFIGS default_pose.
+# (x, y, yaw): yaw = 주행 시작 heading. centerline +s(arclength 증가 방향)를 이 heading에
+# 맞춰 정렬한다 → 전진 주행 시 progress(arclen_delta)>0 보장 (Phase 4 reward 정합).
+# 값은 dreamer_f1tenth TRACK_CONFIGS default_pose와 일치해야 함.
+START_POSES = {
+    # map_easy3: green-ribbon on-track pose (implementation/008). 옛 (8.620,11.860)은
+    # 트랙 밖(outer free CC)이라 잘못된 centerline을 냈음 — max-clearance on-track으로 교체.
+    'map_easy3': (1.02, -14.66, -2.819842),
+    'Oschersleben': (0.0702245, 0.3002981, 2.79787),
+}
+
 
 # ---------------------------------------------------------------------------
 def load_free_mask(map_name):
@@ -54,6 +66,14 @@ def px_to_world(rows, cols, resolution, origin, H):
     x = ox + cols * resolution
     y = oy + (H - 1 - rows) * resolution
     return x, y
+
+
+def world_to_px(x, y, resolution, origin, H):
+    """World (x, y) → image pixel (row, col). Inverse of px_to_world."""
+    ox, oy = float(origin[0]), float(origin[1])
+    col = int(round((x - ox) / resolution))
+    row = int((H - 1) - round((y - oy) / resolution))
+    return row, col
 
 
 # ---------------------------------------------------------------------------
@@ -132,10 +152,31 @@ def order_skeleton_loop(skel_pts):
 # ---------------------------------------------------------------------------
 def extract_centerline(map_name, verify=False):
     free_mask, resolution, origin, H, W = load_free_mask(map_name)
-    print(f"[{map_name}] size={W}x{H} res={resolution} m/px  free={free_mask.sum()}")
+    free_frac = 100.0 * free_mask.sum() / free_mask.size
+    print(f"[{map_name}] size={W}x{H} res={resolution} m/px  free={free_mask.sum()} ({free_frac:.1f}%)")
 
-    skel = skeletonize(free_mask)
-    skel = keep_largest_cc(skel)
+    # ★ The maps draw walls as THIN lines on a ~99% free background, so free space
+    # splits into outer / track-ribbon / infield CCs (4-connectivity). Skeletonizing
+    # ALL free + keep_largest_cc selects the OUTER region → wrong loop (the original
+    # Phase 1-1 bug, implementation/008). Instead isolate the free CC that contains
+    # the start pose (= the drivable track ribbon) and skeletonize only that.
+    if map_name in START_POSES:
+        sx, sy, _syaw = START_POSES[map_name]
+        srow, scol = world_to_px(sx, sy, resolution, origin, H)
+        labeled = label(free_mask, connectivity=1)  # 4-conn: thin walls block leaks
+        start_label = labeled[srow, scol]
+        if start_label == 0:
+            raise RuntimeError(
+                f"{map_name}: start pose ({sx},{sy})→px({srow},{scol}) is NOT free "
+                f"(label 0). Check START_POSES / map registration."
+            )
+        ribbon = labeled == start_label
+        rib_frac = 100.0 * ribbon.sum() / ribbon.size
+        print(f"  ribbon CC (start-pose) = {int(ribbon.sum())} px ({rib_frac:.1f}%)")
+        skel = skeletonize(ribbon)
+    else:
+        # No start pose known — legacy fallback (largest free skeleton CC).
+        skel = keep_largest_cc(skeletonize(free_mask))
     skel = prune_branches(skel, iterations=10)
     rows, cols = np.where(skel)
     n_pts = len(rows)
@@ -147,6 +188,18 @@ def extract_centerline(map_name, verify=False):
     ordered = order_skeleton_loop(list(zip(rows.tolist(), cols.tolist())))
     r_o, c_o = ordered[:, 0], ordered[:, 1]
     x, y = px_to_world(r_o, c_o, resolution, origin, H)
+
+    # Orient the loop so +s (increasing index) matches the start heading, so that
+    # forward driving yields progress (arclen_delta) > 0 in Phase 4 reward. The
+    # skeleton walk direction is otherwise arbitrary. (implementation/008)
+    if map_name in START_POSES:
+        sx, sy, syaw = START_POSES[map_name]
+        ci = int(np.argmin((x - sx) ** 2 + (y - sy) ** 2))
+        nxt = (ci + 1) % len(x)
+        if np.cos(syaw) * (x[nxt] - x[ci]) + np.sin(syaw) * (y[nxt] - y[ci]) < 0:
+            x = x[::-1].copy()
+            y = y[::-1].copy()
+            print("  reversed centerline orientation to match start heading (+s = forward)")
 
     # arclength
     dx = np.diff(x, prepend=x[0])

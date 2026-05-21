@@ -140,15 +140,18 @@ class ConvEncoder1D(nn.Module):
         self._linear.apply(weight_init_1d)
 
     def forward(self, lidar):
-        # lidar: (B, T, input_len)
-        assert lidar.dim() == 3, f"expected (B, T, L), got {tuple(lidar.shape)}"
-        b, t, length = lidar.shape
-        assert length == self.input_len, f"len {length} != {self.input_len}"
-        x = lidar.reshape(b * t, 1, length)    # (B*T, 1, L)
-        x = self.layers(x)                     # (B*T, 256, 34)
-        x = x.reshape(b * t, self._flat_dim)   # (B*T, 8704)
-        x = self._linear(x)                    # (B*T, 512)
-        return x.reshape(b, t, self.outdim)
+        # lidar: (*lead, input_len). lead은 임의 차원 — 학습은 (B, T, L),
+        # 정책 롤아웃은 (B, L). 표준 dreamerv3 인코더처럼 leading dim을 모두
+        # flatten해 둘 다 처리한다 (단일-스텝 정책 경로 대응).
+        assert lidar.shape[-1] == self.input_len, (
+            f"len {tuple(lidar.shape)} last != {self.input_len}"
+        )
+        lead = lidar.shape[:-1]
+        x = lidar.reshape(-1, 1, self.input_len)   # (N, 1, L)
+        x = self.layers(x)                         # (N, C, final_len)
+        x = x.reshape(x.shape[0], self._flat_dim)  # (N, flat)
+        x = self._linear(x)                        # (N, outdim)
+        return x.reshape(*lead, self.outdim)
 
 
 # ---------------------------------------------------------------------------
@@ -229,11 +232,11 @@ class ConvDecoder1D(nn.Module):
         self._linear.apply(uniform_weight_init_1d(outscale))
 
     def forward(self, feat):
-        # feat: (B, T, F) -> SymlogDist with mode (B, T, output_len)
-        assert feat.dim() == 3, f"expected (B, T, F), got {tuple(feat.shape)}"
-        b, t = feat.shape[:2]
-        x = self._linear(feat)                                  # (B, T, 256*34)
-        x = x.reshape(b * t, self._start_ch, self._start_len)   # (B*T, 256, 34)
-        x = self.layers(x)                                      # (B*T, 1, 1080)
-        mean = x.reshape(b, t, self.output_len)                 # (B, T, 1080)
+        # feat: (*lead, F) -> SymlogDist with mode (*lead, output_len).
+        # leading dim 임의 (학습 (B,T,F) / imagination·정책 (B,F)) 모두 flatten 처리.
+        lead = feat.shape[:-1]
+        x = self._linear(feat)                                  # (*lead, start_ch*start_len)
+        x = x.reshape(-1, self._start_ch, self._start_len)      # (N, C, start_len)
+        x = self.layers(x)                                      # (N, 1, output_len)
+        mean = x.reshape(*lead, self.output_len)                # (*lead, output_len)
         return tools.SymlogDist(mean, dist=self._dist, agg="sum")

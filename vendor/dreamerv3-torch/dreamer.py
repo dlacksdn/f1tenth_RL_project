@@ -92,7 +92,13 @@ class Dreamer(nn.Module):
         embed = self._wm.encoder(obs)
         latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
         if self._config.eval_state_mean:
-            latent["stoch"] = latent["mean"]
+            # f1tenth fork-patch (decision #19 + dyn_discrete=16): discrete RSSM
+            # latent has "logit" (no "mean"); use categorical mode (cf. obs_step
+            # sample=False). Continuous latent keeps "mean".
+            if "mean" in latent:
+                latent["stoch"] = latent["mean"]
+            else:
+                latent["stoch"] = self._wm.dynamics.get_dist(latent).mode()
         feat = self._wm.dynamics.get_feat(latent)
         if not training:
             actor = self._task_behavior.actor(feat)

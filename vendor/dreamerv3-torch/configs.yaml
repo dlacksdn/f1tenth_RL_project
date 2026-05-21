@@ -207,7 +207,14 @@ f1tenth:
   eval_episode_num: 20
   eval_state_mean: True
   video_pred_log: False            # decision #14 (vector-only obs; video_pred hardcodes image key)
-  # --- encoder/decoder key routing (Phase 2-2, A8). model dims (mlp_units, 12M)
-  #     finalized in Phase 2-3; these dicts merge over `defaults` key-wise. ---
-  encoder: {lidar_keys: 'lidar', mlp_keys: 'state', cnn_keys: '$^', symlog_inputs: False}  # #15
-  decoder: {lidar_keys: 'lidar', mlp_keys: 'state', cnn_keys: '$^', vector_dist: symlog_mse}
+  # --- 12M model dims (Phase 2-3, A9/A10; v3 §2-3, decision #3). Algorithm HPs
+  #     (dyn_scale/rep_scale/kl_free/lr/train_ratio/discount/...) stay at defaults
+  #     per 007 §2-A (no override). Only size + modality interface differ. ---
+  dyn_hidden: 256
+  dyn_deter: 1024
+  dyn_stoch: 32
+  dyn_discrete: 16
+  units: 256
+  # --- encoder/decoder key routing (Phase 2-2, A8) + size (mlp_units/layers). ---
+  encoder: {lidar_keys: 'lidar', mlp_keys: 'state', cnn_keys: '$^', mlp_units: 256, mlp_layers: 5, symlog_inputs: False}  # #15/#16
+  decoder: {lidar_keys: 'lidar', mlp_keys: 'state', cnn_keys: '$^', mlp_units: 256, mlp_layers: 5, vector_dist: symlog_mse}

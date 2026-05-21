@@ -99,7 +99,11 @@ class ConvEncoder1D(nn.Module):
         self,
         input_len=1080,
         out_dim=512,
-        depths=(16, 32, 64, 128, 256),
+        # 6 stride-2 stages, channels capped at 128 (A10-driven, planning/010):
+        # 1080->540->270->135->68->34->17, flatten 128*17=2176. The original
+        # #16 spec (5 stages -> 8704 flatten) made the mirror decoder's
+        # Linear(feat,8704)=13.4M and blew the 12M target (measured 26.6M).
+        depths=(16, 32, 64, 128, 128, 128),
         kernel_size=3,
         act="SiLU",
         norm=True,
@@ -157,7 +161,9 @@ class ConvDecoder1D(nn.Module):
         self,
         feat_size,
         output_len=1080,
-        depths=(256, 128, 64, 32, 16),
+        # mirror of ConvEncoder1D (6 stages, bottleneck 128). depths[0] is the
+        # bottleneck channel; output channel is fixed at 1 (planning/010).
+        depths=(128, 128, 128, 64, 32, 16),
         kernel_size=3,
         act="SiLU",
         norm=True,

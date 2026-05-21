@@ -18,9 +18,10 @@ FEAT = 1536  # 12M discrete RSSM feat = dyn_stoch*dyn_discrete + dyn_deter = 32*
 
 def test_a7_encoder_shape_and_schedule():
     enc = ConvEncoder1D(input_len=LIDAR_LEN, out_dim=512)
-    assert enc.stage_lengths == [1080, 540, 270, 135, 68, 34]
-    assert enc._final_ch == 256
-    assert enc._flat_dim == 8704
+    # 6 stages, channels capped at 128 (A10-driven, planning/010).
+    assert enc.stage_lengths == [1080, 540, 270, 135, 68, 34, 17]
+    assert enc._final_ch == 128
+    assert enc._flat_dim == 128 * 17  # 2176
     assert enc.outdim == 512
 
     x = torch.rand(B, T, LIDAR_LEN)

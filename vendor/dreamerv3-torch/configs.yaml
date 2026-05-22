@@ -72,6 +72,13 @@ defaults:
   dataset_size: 1000000
   opt: 'adam'
 
+  # Phase 5 Stage 2 fine-tune (planning/015 #21/#9). Defaults = no-op (Stage 1
+  # resume / scratch 무영향). Stage 2서만 CLI override.
+  warm_load_ckpt: ''         # #21: 비어있지 않으면(그리고 logdir/latest.pt 부재 시) 이 ckpt에서 world model weights만 warm load. actor/critic + 모든 optimizer는 fresh.
+  warm_lr_scale: 1.0         # #21: warm-load 첫 시작에만 model/actor/value lr에 곱(R3: 0.5). resume엔 무영향.
+  joint_replay_ratio: 0.0    # #9: >0이면 매 배치 element를 이 확률로 joint_replay_dir(Stage1)에서 샘플(나머지는 현 트랙). #31 미달 시 0.5.
+  joint_replay_dir: ''       # #9: Stage1 train_eps 디렉토리(절대경로). joint_replay_ratio>0일 때만 사용.
+
   # Behavior.
   discount: 0.997
   discount_lambda: 0.95

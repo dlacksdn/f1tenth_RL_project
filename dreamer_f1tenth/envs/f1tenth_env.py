@@ -140,6 +140,9 @@ class F110GymnasiumWrapper(gymnasium.Env):
         self.action_repeat = int(action_repeat)
         self.max_episode_steps = int(max_episode_steps)
         self.ignore_first_collision = bool(ignore_first_collision)
+        # 1 wrapper-step 실경과 sim 시간(s). f110 timestep × action_repeat로 도출
+        # (0.02 하드코딩 금지, 020 §3-4: action_repeat 변경 시 silent 오류 방지).
+        self._dt_wrap = SIM_TIMESTEP * self.action_repeat
         self.L_track = float(cfg["L_track"])
         self.R_lap = float(cfg["R_lap"])
         self._default_pose = (
@@ -193,11 +196,29 @@ class F110GymnasiumWrapper(gymnasium.Env):
         self._closest_idx = 0       # windowed closest-point index (이전 step 기준)
         self._total_arclen = 0.0    # 시작점 기준 누적 진행거리(m, 부호 포함)
         self._lap_count_arc = 0     # arclength wrap 기반 lap 카운트
+        self._lap_start_step = 0    # 현재 lap 시작 env_step (per-lap lap_time_s 산출용, 020 §1)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _build_obs(self, raw, is_first=False, is_terminal=False, is_last=False):
+    # 진단 log_ 신호 키 집합 (020 §1 경로①). observation_space에는 넣지 않으며
+    # (5-key 유지), step/reset 모든 transition에 동일 키를 채워 simulate cache의
+    # 키 일관성을 보장한다. tools.simulate는 "log_" 키를 encoder 입력에서 strip
+    # (tools.py:167) → world model 무영향. transition=o.copy()로 cache/npz 보존
+    # → save_episodes(npz) + log_ TB 합산(tools.py:213-217). 모든 값 float32.
+    _LOG_KEYS = (
+        "log_lap_time_s",        # per-lap 완주 step에만 그 lap 실경과 sim 시간(s); 그 외 0
+        "log_reward_progress",   # A-5(A17) reward component 분리 (step별)
+        "log_reward_collision",
+        "log_reward_reverse",
+        "log_reward_diverged",
+        "log_reward_lap",
+        "log_lap_count_arc",     # 현재 누적 lap 수(진단; npz per-step 추적용)
+        "log_completed",         # lap_complete(2-lap) 종료 step에 1.0; 그 외 0
+    )
+
+    def _build_obs(self, raw, is_first=False, is_terminal=False, is_last=False,
+                   log_fields=None):
         lidar = np.asarray(raw["scans"][0], dtype=np.float64)
         # f110 ST dynamics can numerically diverge (inf/huge) -> non-finite obs
         # poisons the replay buffer (encoder overflow -> NaN logit). Sanitize so
@@ -220,13 +241,18 @@ class F110GymnasiumWrapper(gymnasium.Env):
         )
         state = np.clip(state_raw / _STATE_SCALE, -_STATE_CLIP, _STATE_CLIP)
 
-        return OrderedDict([
+        obs = OrderedDict([
             ("lidar", lidar),
             ("state", state.astype(np.float32)),
             ("is_first", bool(is_first)),
             ("is_terminal", bool(is_terminal)),
             ("is_last", bool(is_last)),
         ])
+        # log_ 진단 키: 기본 0.0, log_fields로 덮어쓰기. 전 transition 동일 키 집합.
+        lf = log_fields or {}
+        for k in self._LOG_KEYS:
+            obs[k] = np.float32(lf.get(k, 0.0))
+        return obs
 
     def _global_closest_idx(self, pos):
         """전역 argmin closest-point index. reset 시 1회 사용."""
@@ -268,7 +294,9 @@ class F110GymnasiumWrapper(gymnasium.Env):
         self._closest_idx = self._global_closest_idx(start_pos)
         self._total_arclen = 0.0
         self._lap_count_arc = 0
+        self._lap_start_step = 0
 
+        # is_first transition: log_ 키는 기본 0(log_fields=None) → 전 transition 키 일관성.
         obs = self._build_obs(raw, is_first=True, is_terminal=False, is_last=False)
         info = {"cause": None, "trackname": self.trackname, "env_step": 0}
         return obs, info
@@ -324,8 +352,13 @@ class F110GymnasiumWrapper(gymnasium.Env):
         # lap = 순방향 누적의 high-water-mark (경계 왕복 reward farming 방지 = 방향 가드).
         current_lap = int(self._total_arclen // self.L_track)
         lap_increased = current_lap > self._lap_count_arc
+        # per-lap lap_time_s (020 §1·§1-2): lap 증가 step에만 그 lap 실경과 sim 시간.
+        # = Δenv_step × DT_WRAP(=SIM_TIMESTEP×action_repeat). 진단 신호, 판정 무영향.
+        lap_time_s = 0.0
         if lap_increased:
             self._lap_count_arc = current_lap
+            lap_time_s = (self._env_step - self._lap_start_step) * self._dt_wrap
+            self._lap_start_step = self._env_step
 
         # reverse_guard (v3 §3 1-4, decision #8/#24): centerline tangent · world-frame
         # velocity < 0 (후진) 가 REVERSE_COUNTER_LIMIT env step 연속 지속 시 종료.
@@ -400,7 +433,20 @@ class F110GymnasiumWrapper(gymnasium.Env):
         self._prev_steer = steer
         self._prev_speed = speed
 
-        obs = self._build_obs(raw, is_first=False, is_terminal=is_terminal, is_last=is_last)
+        # 진단 log_ 신호(020 §1 경로①): obs에 노출 → simulate cache/npz 보존 + TB 합산.
+        # reward component(A-5/A17)와 per-lap lap_time(A-1)을 동일 채널로 흡수.
+        log_fields = {
+            "log_lap_time_s": lap_time_s,
+            "log_reward_progress": progress_r,
+            "log_reward_collision": collision_r,
+            "log_reward_reverse": reverse_r,
+            "log_reward_diverged": diverged_r,
+            "log_reward_lap": lap_r,
+            "log_lap_count_arc": float(self._lap_count_arc),
+            "log_completed": 1.0 if cause == "lap_complete" else 0.0,
+        }
+        obs = self._build_obs(raw, is_first=False, is_terminal=is_terminal,
+                              is_last=is_last, log_fields=log_fields)
 
         info = {
             "cause": cause,

@@ -14,6 +14,7 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 import exploration as expl
 import models
 import tools
+import snapshot_utils
 import envs.wrappers as wrappers
 from parallel import Parallel, Damy
 
@@ -308,6 +309,20 @@ def main(config):
         agent.load_state_dict(checkpoint["agent_state_dict"])
         tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
         agent._should_pretrain._once = False
+        # A-3 (019 §4, C-N10/R7): watchdog resume 시 Every 주기 위상 복원.
+        # _last=None 재기준(주기 1회 어긋남) 방지. 하위호환: 구 ckpt엔 "counters" 부재.
+        if "counters" in checkpoint:
+            agent._should_log._last = checkpoint["counters"]["log"]
+            agent._should_train._last = checkpoint["counters"]["train"]
+            agent._should_reset._last = checkpoint["counters"]["reset"]
+
+    # A-1 snapshot (사용자 결정 2026-05-22): 10초 고정 폭 bin best + global best.
+    # f1tenth 외 suite는 snapshot_* config 부재 → getattr 기본값으로 무해 비활성.
+    snapshot_bins = {}     # {label(상한): {lap_time, path}} — 10초 구간별 best
+    snapshot_best = {}     # {lap_time, path} — 전체 최단 lap policy(계속 갱신)
+    _snap_bin_width = float(getattr(config, "snapshot_bin_width", 0.0) or 0.0)
+    _snap_lap_max = float(getattr(config, "snapshot_lap_max", 0.0) or 0.0)
+    _snap_interval_keep = bool(getattr(config, "snapshot_interval_keep", False))
 
     # make sure eval will be executed once after config.steps
     while agent._step < config.steps + config.eval_every:
@@ -327,6 +342,20 @@ def main(config):
             if config.video_pred_log:
                 video_pred = agent._wm.video_pred(next(eval_dataset))
                 logger.video("eval_openl", to_np(video_pred))
+            # A-1 diversity+best snapshot: 이번 eval episodes의 per-lap lap_time_s(log_
+            # obs → npz 보존)를 10초 bin best + global best로 큐레이션. partial(_wm.*+actor.*).
+            if _snap_bin_width > 0 and _snap_lap_max > 0:
+                try:
+                    laps = snapshot_utils.collect_eval_lap_times(
+                        config.evaldir, config.eval_episode_num
+                    )
+                    snapshot_utils.update_diversity_snapshots(
+                        agent, laps, snapshot_bins, snapshot_best, logdir,
+                        bin_width=_snap_bin_width, lap_max=_snap_lap_max,
+                        step_k=agent._step // 1000,
+                    )
+                except Exception as e:
+                    print(f"[snapshot] diversity skip: {e}")
         print("Start training.")
         state = tools.simulate(
             agent,
@@ -341,8 +370,22 @@ def main(config):
         items_to_save = {
             "agent_state_dict": agent.state_dict(),
             "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
+            # A-3 (019 §4): Every 주기 위상 — watchdog resume 시 _last=None 재기준 방지.
+            "counters": {
+                "log": agent._should_log._last,
+                "train": agent._should_train._last,
+                "reset": agent._should_reset._last,
+            },
         }
         torch.save(items_to_save, logdir / "latest.pt")
+        # A-1 interval snapshot (A15): latest.pt 직후 full ckpt를 step_{N}k.pt로 별도 보존.
+        if _snap_interval_keep:
+            try:
+                snapshot_utils.save_interval_snapshot(
+                    items_to_save, logdir, agent._step // 1000, keep=True
+                )
+            except Exception as e:
+                print(f"[snapshot] interval skip: {e}")
     for env in train_envs + eval_envs:
         try:
             env.close()

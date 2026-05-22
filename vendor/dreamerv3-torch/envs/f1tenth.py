@@ -50,6 +50,12 @@ class F1Tenth:
 
     def __init__(self, task, action_repeat=2, seed=0):
         # task == trackname, e.g. "map_easy3" / "Oschersleben" (decision #25).
+        # Keep ctor args for pickling (parallel.py cloudpickle-s the env to each
+        # worker process; F110Env itself is not picklable). __getstate__/__setstate__
+        # send only these args and re-create the env in the subprocess (EzPickle-style).
+        self._task = task
+        self._action_repeat = action_repeat
+        self._seed = seed
         self._env = F110GymnasiumWrapper(
             trackname=task,
             action_repeat=action_repeat,
@@ -57,6 +63,18 @@ class F1Tenth:
             seed=seed,
         )
         self.reward_range = [-np.inf, np.inf]
+
+    def __getstate__(self):
+        # Only ctor args travel to the worker process (envs=N parallel collection).
+        return {
+            "_task": self._task,
+            "_action_repeat": self._action_repeat,
+            "_seed": self._seed,
+        }
+
+    def __setstate__(self, state):
+        # Re-create the (non-picklable) F110Env inside the worker process.
+        self.__init__(state["_task"], state["_action_repeat"], state["_seed"])
 
     @property
     def observation_space(self):

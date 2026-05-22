@@ -51,7 +51,8 @@ def rolling_mean(y, window):
 def main():
     ap = argparse.ArgumentParser(description="학습 return 곡선 플롯(ppt용)")
     ap.add_argument("--logdir", default="runs/stage1_map_easy3")
-    ap.add_argument("--out", default=None, help="기본: <logdir>/return_curve.png")
+    ap.add_argument("--out", default=None,
+                    help="기본: <logdir>/return_curve-N.png (덮어쓰기 X, 다음 빈 번호 자동)")
     ap.add_argument("--window", type=int, default=15, help="train_return 이동평균 윈도우")
     ap.add_argument("--title", default=None)
     args = ap.parse_args()
@@ -65,7 +66,14 @@ def main():
         raise FileNotFoundError(f"metrics.jsonl 없음: {metrics_path}")
 
     tr_s, tr_v, ev_s, ev_v = load_metrics(metrics_path)
-    out = pathlib.Path(args.out) if args.out else (logdir / "return_curve.png")
+    # --out 미지정 시 덮어쓰지 않고 다음 빈 번호로 저장(return_curve-1.png, -2, ...).
+    if args.out:
+        out = pathlib.Path(args.out)
+    else:
+        n = 1
+        while (logdir / f"return_curve-{n}.png").exists():
+            n += 1
+        out = logdir / f"return_curve-{n}.png"
     title = args.title or f"Training Return — {logdir.name}"
 
     fig, ax = plt.subplots(figsize=(10, 6), dpi=150)

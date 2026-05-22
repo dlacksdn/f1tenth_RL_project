@@ -54,6 +54,12 @@ python -u dreamer.py --configs f1tenth --task f1tenth_Oschersleben \
 - env 물리/reward/판정/fixed-HP 무변경(A-2는 main 배선 + 운영 스크립트만).
 - 자동 시작은 검증된 경로 + fail-fast 가드로 보호. 깨어났을 때 GPU/로그 재확인 후 보고.
 
+## 마일스톤 그래프 (사용자 요청 2026-05-23)
+- 폴링(/tmp/stage1_poll.sh)이 step **300k·400k 도달 시 plot_returns.py 자동 실행**
+  → return_curve-N.png 증분 저장(덮어쓰기 X, [[output-no-overwrite]]). 500k 완료 시 500k 그래프 후 트리거.
+- plot_returns.py: --out 미지정 시 return_curve-N.png 다음 빈 번호 자동(2026-05-23 수정).
+- 진동(eval 0/1)이 후반(400~500k)에 잦아드는지 추세 확인용. 깨어났을 때 300/400/500k 그래프 일괄 제시.
+
 ## 다음 단계
 Stage2 시작 후: snapshot(Oschersleben bin 10초폭/110s) + eval로 주행시간 추이 모니터.
 충분한 주행시간 도달 시 조기 종료 판단(사용자 보고). forgetting/적응속도 보고 lr·ratio 재조정 여지.

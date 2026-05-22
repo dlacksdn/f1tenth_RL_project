@@ -306,12 +306,23 @@ def main(config):
         stage1_eps = tools.load_episodes(
             config.joint_replay_dir, limit=config.dataset_size
         )
+        # 6a fail-fast(024 검증): 오타/빈 디렉토리면 첫 Stage1 샘플 추출에서 모호한
+        #  "ValueError: 'a' cannot be empty"로 죽음 → 사전 명확 메시지로 조기 차단.
+        assert len(stage1_eps) > 0, (
+            f"joint_replay_dir에 episode(.npz)가 없습니다: {config.joint_replay_dir}"
+        )
         train_dataset = stage2_utils.make_joint_dataset(train_eps, stage1_eps, config)
         print(
             f"[joint-replay] ratio={config.joint_replay_ratio} "
             f"dir={config.joint_replay_dir} ({len(stage1_eps)} stage1 eps)"
         )
     else:
+        # 6b(024 검증): ratio>0인데 dir 미지정이면 joint가 조용히 비활성 → 운영 실수 경고.
+        if config.joint_replay_ratio > 0 and not config.joint_replay_dir:
+            print(
+                "[joint-replay] WARNING: joint_replay_ratio>0 이나 joint_replay_dir "
+                "미지정 → joint replay 비활성(단일 트랙 학습)."
+            )
         train_dataset = make_dataset(train_eps, config)
     eval_dataset = make_dataset(eval_eps, config)
     # A-2 warm_lr_scale (#21/R3): forgetting 방어용 lr 축소. 반드시 agent(Optimizer) 생성 전
@@ -359,6 +370,10 @@ def main(config):
         #  actor/critic weights + 모든 optimizer는 fresh(strict=False). lr은 위에서 scale 적용.
         #  B-2(020 §3-5): _task_behavior._world_model.* 가 missing_keys로 떠도 정상(공유 텐서).
         #  world model warm이므로 _should_pretrain._once=False(resume과 동일, 020 검수 권장).
+        # 6c fail-fast(024 검증): 오타 ckpt 경로면 torch.load raw 스택트레이스 → 사전 명확 차단.
+        assert pathlib.Path(config.warm_load_ckpt).exists(), (
+            f"warm_load_ckpt 경로가 존재하지 않습니다: {config.warm_load_ckpt}"
+        )
         ckpt = torch.load(config.warm_load_ckpt, map_location=config.device)
         wm_state = stage2_utils.extract_warm_state(ckpt["agent_state_dict"])
         missing, unexpected = agent.load_state_dict(wm_state, strict=False)

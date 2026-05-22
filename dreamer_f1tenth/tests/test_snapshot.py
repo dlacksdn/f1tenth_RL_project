@@ -19,6 +19,24 @@ import snapshot_utils as su  # vendor/dreamerv3-torch (conftest sys.path)
 # ---------------------------------------------------------------------------
 # bin 분류
 # ---------------------------------------------------------------------------
+def test_resolve_track_value():
+    bw = {"map_easy3": 1.0, "oschersleben": 10.0}
+    assert su.resolve_track_value(bw, "map_easy3") == 1.0
+    assert su.resolve_track_value(bw, "Oschersleben") == 10.0  # 대문자 → lower 매칭
+    assert su.resolve_track_value(bw, "unknown") is None
+    assert su.resolve_track_value(10.0, "x") == 10.0           # 스칼라 그대로
+    assert su.resolve_track_value(None, "x") is None
+
+
+def test_lap_time_bin_1s_width_map_easy3():
+    W, MAX = 1.0, 20.0  # map_easy3 실측 8~13s: (7,8]→8, (8,9]→9, (9,10]→10
+    assert su.lap_time_bin(8.06, W, MAX) == 9    # ceil(8.06)=9
+    assert su.lap_time_bin(8.0, W, MAX) == 8     # 경계 우상향 폐구간
+    assert su.lap_time_bin(10.28, W, MAX) == 11  # ceil(10.28)=11
+    assert su.lap_time_bin(20.0, W, MAX) == 20
+    assert su.lap_time_bin(20.1, W, MAX) is None
+
+
 def test_lap_time_bin_10s_fixed_width():
     W, MAX = 10.0, 110.0  # (0,10]→10,(10,20]→20,...,(100,110]→110 (상한 label)
     assert su.lap_time_bin(0.0, W, MAX) is None

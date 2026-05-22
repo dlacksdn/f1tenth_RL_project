@@ -318,10 +318,13 @@ def main(config):
 
     # A-1 snapshot (사용자 결정 2026-05-22): 10초 고정 폭 bin best + global best.
     # f1tenth 외 suite는 snapshot_* config 부재 → getattr 기본값으로 무해 비활성.
-    snapshot_bins = {}     # {label(상한): {lap_time, path}} — 10초 구간별 best
+    snapshot_bins = {}     # {label(상한): {lap_time, path}} — bin 구간별 best
     snapshot_best = {}     # {lap_time, path} — 전체 최단 lap policy(계속 갱신)
-    _snap_bin_width = float(getattr(config, "snapshot_bin_width", 0.0) or 0.0)
-    _snap_lap_max = float(getattr(config, "snapshot_lap_max", 0.0) or 0.0)
+    _trackname = config.task.split("_", 1)[1] if "_" in config.task else config.task
+    _snap_bin_width = snapshot_utils.resolve_track_value(
+        getattr(config, "snapshot_bin_width", None), _trackname) or 0.0
+    _snap_lap_max = snapshot_utils.resolve_track_value(
+        getattr(config, "snapshot_lap_max", None), _trackname) or 0.0
     _snap_interval_keep = bool(getattr(config, "snapshot_interval_keep", False))
 
     # make sure eval will be executed once after config.steps

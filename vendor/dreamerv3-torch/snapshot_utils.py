@@ -88,6 +88,22 @@ def save_interval_snapshot(items_to_save, logdir, step_k, keep=True):
     return path
 
 
+def resolve_track_value(value, trackname):
+    """트랙별 dict면 trackname(대소문자 무관) 조회, 스칼라면 그대로, None이면 None.
+
+    map_easy3=(1s,20s) / Oschersleben=(10s,110s)처럼 트랙별 bin 폭·상한을 분리(사용자
+    결정 2026-05-22). yaml 소문자 키 vs 'Oschersleben' 대문자 trackname robust.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return float(value)
+    for key in (trackname, trackname.lower()):
+        if key in value:
+            return float(value[key])
+    return None
+
+
 def _unlink_if(old_path, keep_path):
     """old_path가 keep_path와 다르면 삭제(bin/best당 1개 유지용)."""
     if not old_path:

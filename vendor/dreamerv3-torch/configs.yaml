@@ -215,8 +215,9 @@ f1tenth:
   eval_state_mean: True
   video_pred_log: False            # decision #14 (vector-only obs; video_pred hardcodes image key)
   # --- A-1 snapshot (orchestration layer, .py 배선 완료; 사용자 결정 2026-05-22) ---
-  snapshot_bin_width: 10.0         # diversity bin 고정 폭(초). 110/100/.../10 구간별 best 1개
-  snapshot_lap_max: 110.0          # 저장 상한 lap_time(초). 초과는 미저장(110부터 하나씩)
+  # 트랙별 bin: map_easy3 실측 lap~8-13s → 1초폭/상한20s 촘촘. Oschersleben~90-110s → 10초폭/110s.
+  snapshot_bin_width: {map_easy3: 1.0, oschersleben: 10.0}    # 트랙별 diversity bin 폭(초)
+  snapshot_lap_max: {map_easy3: 20.0, oschersleben: 110.0}    # 트랙별 저장 상한 lap_time(초)
   snapshot_interval_keep: True     # eval_every마다 step_{N}k.pt full ckpt 별도 보존(A15, 덮어쓰기 X)
   # --- 12M model dims (Phase 2-3, A9/A10; v3 §2-3, decision #3). Algorithm HPs
   #     (dyn_scale/rep_scale/kl_free/lr/train_ratio/discount/...) stay at defaults

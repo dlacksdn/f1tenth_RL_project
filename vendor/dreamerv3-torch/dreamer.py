@@ -15,6 +15,7 @@ import exploration as expl
 import models
 import tools
 import snapshot_utils
+import stage2_utils
 import envs.wrappers as wrappers
 from parallel import Parallel, Damy
 
@@ -294,8 +295,35 @@ def main(config):
         print(f"Logger: ({logger.step} steps).")
 
     print("Simulate agent.")
-    train_dataset = make_dataset(train_eps, config)
+    # A-2 (019 §3, 020 §3): Stage 2 fine-tune 분기 판정.
+    #  _is_resume: latest.pt 있으면 전체 resume(warm 무시) → Stage2 crash 시 watchdog 호환.
+    #  _do_warm: resume 아니고 warm_load_ckpt 지정 시 world model만 warm-load.
+    _is_resume = (logdir / "latest.pt").exists()
+    _do_warm = (not _is_resume) and bool(config.warm_load_ckpt)
+    # A-2 joint replay (#9): joint_replay_ratio>0 ∧ joint_replay_dir 이면 Stage1 episodes를
+    #  현 트랙 episodes와 ratio로 섞어 학습. 아니면 기존 make_dataset(Stage1 resume/scratch 무영향).
+    if config.joint_replay_ratio > 0 and config.joint_replay_dir:
+        stage1_eps = tools.load_episodes(
+            config.joint_replay_dir, limit=config.dataset_size
+        )
+        train_dataset = stage2_utils.make_joint_dataset(train_eps, stage1_eps, config)
+        print(
+            f"[joint-replay] ratio={config.joint_replay_ratio} "
+            f"dir={config.joint_replay_dir} ({len(stage1_eps)} stage1 eps)"
+        )
+    else:
+        train_dataset = make_dataset(train_eps, config)
     eval_dataset = make_dataset(eval_eps, config)
+    # A-2 warm_lr_scale (#21/R3): forgetting 방어용 lr 축소. 반드시 agent(Optimizer) 생성 전
+    #  적용해야 옵티마이저가 scaled lr로 생성됨(020 §3-2). resume/scratch(scale=1.0)은 무변경.
+    if _do_warm and config.warm_lr_scale != 1.0:
+        config.model_lr *= config.warm_lr_scale  # models.py:94
+        config.actor["lr"] *= config.warm_lr_scale  # models.py:267
+        config.critic["lr"] *= config.warm_lr_scale  # models.py:278
+        print(
+            f"[warm-load] lr scaled by {config.warm_lr_scale}: "
+            f"model={config.model_lr} actor={config.actor['lr']} critic={config.critic['lr']}"
+        )
     agent = Dreamer(
         train_envs[0].observation_space,
         train_envs[0].action_space,
@@ -311,7 +339,7 @@ def main(config):
     #   별도 logdir/process라 snapshot이 이미 독립 — 정상. 파일명 policy_best_* 유지.
     snapshot_bins = {}     # {label(상한): {lap_time, path}} — bin 구간별 best
     snapshot_best = {}     # {lap_time, path} — 이 run(트랙)의 최단 lap policy(계속 갱신)
-    if (logdir / "latest.pt").exists():
+    if _is_resume:
         checkpoint = torch.load(logdir / "latest.pt")
         agent.load_state_dict(checkpoint["agent_state_dict"])
         tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
@@ -326,6 +354,21 @@ def main(config):
         # 기존 policy_lap*/policy_best* 파일을 모른 채 재저장 → step suffix 다른 중복 누적.
         # checkpoint의 "snapshot_state"로 bins/best 복원. 하위호환: 키 부재 시 ({},{}).
         snapshot_bins, snapshot_best = snapshot_utils.restore_snapshot_state(checkpoint)
+    elif _do_warm:
+        # A-2 warm-load (#21/017 §2): Stage1 ckpt의 world model weights(_wm.*)만 로드.
+        #  actor/critic weights + 모든 optimizer는 fresh(strict=False). lr은 위에서 scale 적용.
+        #  B-2(020 §3-5): _task_behavior._world_model.* 가 missing_keys로 떠도 정상(공유 텐서).
+        #  world model warm이므로 _should_pretrain._once=False(resume과 동일, 020 검수 권장).
+        ckpt = torch.load(config.warm_load_ckpt, map_location=config.device)
+        wm_state = stage2_utils.extract_warm_state(ckpt["agent_state_dict"])
+        missing, unexpected = agent.load_state_dict(wm_state, strict=False)
+        agent._should_pretrain._once = False
+        _wm_missing = [k for k in missing if k.startswith("_wm.")]
+        print(
+            f"[warm-load] loaded {len(wm_state)} _wm.* keys from {config.warm_load_ckpt}; "
+            f"unexpected={len(unexpected)} _wm-missing={len(_wm_missing)} "
+            f"(actor/critic/optim fresh)"
+        )
     _trackname = config.task.split("_", 1)[1] if "_" in config.task else config.task
     _snap_bin_width = snapshot_utils.resolve_track_value(
         getattr(config, "snapshot_bin_width", None), _trackname) or 0.0

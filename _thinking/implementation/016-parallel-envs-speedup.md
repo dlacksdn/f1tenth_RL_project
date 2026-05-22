@@ -55,6 +55,16 @@
 - **crash 자동 감지 모니터** 상시 가동: 프로세스 사망 시 즉시 알림 → resume.
 - 14h 장시간 멀티프로세스 안정성은 미검증이나, 위 장치로 다운사이드 = "15분 손실 후 재개" 수준.
 
+## 6-B. ★ GPU util 측정 정정 (WSL nvidia-smi vs Windows 작업관리자)
+
+- §1/§2의 GPU util(~30%/~50%)은 **WSL2 `nvidia-smi utilization.gpu` 기준 — 과소측정**.
+- **Windows 호스트 작업관리자(Parsec)는 envs=8에서 GPU 99%** = 사실상 포화. VRAM 4.8/8GB.
+  CPU는 13%(논리 12스레드 중 ~1.5개; 물리 6코어 Ryzen 5 7500F).
+- 정정된 그림: GPU가 거의 포화 → envs=8가 GPU 여유분을 거의 다 사용. §3의 "GPU 30%는 소형모델이라
+  못 채움"은 WSL 측정 착시였고, **실제로는 GPU가 병목/포화**. envs를 더 늘려도 GPU 한계라 무의미.
+- 결론 불변: envs=8 = fixed-HP 하 거의 상한. CPU 1코어는 GPU 포화의 방증(정상).
+- WSL2 nvidia-smi utilization은 신뢰 말 것 → 자원 측정은 Windows 호스트 작업관리자 기준.
+
 ## 7. 폴백
 - envs=8가 14h 중 불안정(반복 crash/hang) 시 → **envs=1 복구**(20.9h 안정, A19 검증값).
 - Stage 2(Oschersleben)도 동일 envs=8 적용 검토(맵만 다르고 학습 비용 동일, 시나리오 무관).

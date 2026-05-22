@@ -143,3 +143,47 @@ def test_save_interval_snapshot(tmp_path):
     assert p.name == "step_130k.pt"
     assert p.exists()
     assert su.save_interval_snapshot(items, tmp_path, step_k=131, keep=False) is None
+
+
+# ---------------------------------------------------------------------------
+# B-1: snapshot_state persist / restore (021 §6)
+# ---------------------------------------------------------------------------
+def test_pack_restore_roundtrip_inmemory():
+    bins = {10: {"lap_time": 8.0, "path": "/x/policy_lap8.0s_step10k.pt"},
+            100: {"lap_time": 95.0, "path": "/x/policy_lap95.0s_step40k.pt"}}
+    best = {"lap_time": 7.0, "path": "/x/policy_best_lap7.0s_step30k.pt"}
+    ckpt = {"snapshot_state": su.pack_snapshot_state(bins, best)}
+    rb, rbest = su.restore_snapshot_state(ckpt)
+    assert rb == bins and rbest == best
+
+
+def test_restore_returns_fresh_dicts():
+    # 복원 dict는 원본과 별개여야 mutation 누수 없음.
+    bins = {10: {"lap_time": 8.0, "path": "p"}}
+    best = {"lap_time": 8.0, "path": "p"}
+    ckpt = {"snapshot_state": su.pack_snapshot_state(bins, best)}
+    rb, rbest = su.restore_snapshot_state(ckpt)
+    rb[20] = {"lap_time": 9.0, "path": "q"}
+    rbest["lap_time"] = 99.0
+    assert 20 not in bins          # 원본 bins 불변
+    assert best["lap_time"] == 8.0  # 원본 best 불변
+
+
+def test_restore_backward_compat_missing_key():
+    # 구 ckpt(snapshot_state 부재) → ({}, {}) (하위호환).
+    assert su.restore_snapshot_state({"agent_state_dict": {}}) == ({}, {})
+    assert su.restore_snapshot_state({}) == ({}, {})
+    assert su.restore_snapshot_state(None) == ({}, {})
+
+
+def test_pack_restore_through_torch_save(tmp_path):
+    # 실제 torch.save/load 직렬화 경로 검증(dreamer.py latest.pt 저장 경로 미러).
+    bins = {10: {"lap_time": 8.0, "path": "/x/p10.pt"}}
+    best = {"lap_time": 8.0, "path": "/x/best.pt"}
+    items = {"agent_state_dict": {"w": torch.zeros(2)},
+             "snapshot_state": su.pack_snapshot_state(bins, best)}
+    p = tmp_path / "latest.pt"
+    torch.save(items, str(p))
+    loaded = torch.load(str(p))
+    rb, rbest = su.restore_snapshot_state(loaded)
+    assert rb == bins and rbest == best

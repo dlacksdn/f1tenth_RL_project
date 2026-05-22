@@ -304,6 +304,13 @@ def main(config):
         train_dataset,
     ).to(config.device)
     agent.requires_grad_(requires_grad=False)
+    # A-1 snapshot (사용자 결정 2026-05-22): 트랙별 고정 폭 bin best + run best(트랙별).
+    # f1tenth 외 suite는 snapshot_* config 부재 → getattr 기본값으로 무해 비활성.
+    # B-2(021 §6): "run best"는 이 run(logdir = 트랙별 process) 단위의 최단 lap policy
+    #   1개를 가리킨다(과거 "global best" 명칭의 오해 소지 제거). 트랙 전환(Stage2)은
+    #   별도 logdir/process라 snapshot이 이미 독립 — 정상. 파일명 policy_best_* 유지.
+    snapshot_bins = {}     # {label(상한): {lap_time, path}} — bin 구간별 best
+    snapshot_best = {}     # {lap_time, path} — 이 run(트랙)의 최단 lap policy(계속 갱신)
     if (logdir / "latest.pt").exists():
         checkpoint = torch.load(logdir / "latest.pt")
         agent.load_state_dict(checkpoint["agent_state_dict"])
@@ -315,11 +322,10 @@ def main(config):
             agent._should_log._last = checkpoint["counters"]["log"]
             agent._should_train._last = checkpoint["counters"]["train"]
             agent._should_reset._last = checkpoint["counters"]["reset"]
-
-    # A-1 snapshot (사용자 결정 2026-05-22): 10초 고정 폭 bin best + global best.
-    # f1tenth 외 suite는 snapshot_* config 부재 → getattr 기본값으로 무해 비활성.
-    snapshot_bins = {}     # {label(상한): {lap_time, path}} — bin 구간별 best
-    snapshot_best = {}     # {lap_time, path} — 전체 최단 lap policy(계속 갱신)
+        # B-1 (021 §6): watchdog resume 시 snapshot 상태가 메모리 {}로 리셋되면 디스크의
+        # 기존 policy_lap*/policy_best* 파일을 모른 채 재저장 → step suffix 다른 중복 누적.
+        # checkpoint의 "snapshot_state"로 bins/best 복원. 하위호환: 키 부재 시 ({},{}).
+        snapshot_bins, snapshot_best = snapshot_utils.restore_snapshot_state(checkpoint)
     _trackname = config.task.split("_", 1)[1] if "_" in config.task else config.task
     _snap_bin_width = snapshot_utils.resolve_track_value(
         getattr(config, "snapshot_bin_width", None), _trackname) or 0.0
@@ -346,7 +352,7 @@ def main(config):
                 video_pred = agent._wm.video_pred(next(eval_dataset))
                 logger.video("eval_openl", to_np(video_pred))
             # A-1 diversity+best snapshot: 이번 eval episodes의 per-lap lap_time_s(log_
-            # obs → npz 보존)를 10초 bin best + global best로 큐레이션. partial(_wm.*+actor.*).
+            # obs → npz 보존)를 트랙별 bin best + run best(트랙별)로 큐레이션. partial(_wm.*+actor.*).
             if _snap_bin_width > 0 and _snap_lap_max > 0:
                 try:
                     laps = snapshot_utils.collect_eval_lap_times(
@@ -379,6 +385,11 @@ def main(config):
                 "train": agent._should_train._last,
                 "reset": agent._should_reset._last,
             },
+            # B-1 (021 §6): snapshot bin/run-best 상태 persist → resume 시 복원(위 307~).
+            # 디스크 기존 policy_* 파일 인지 → 중복 누적 방지.
+            "snapshot_state": snapshot_utils.pack_snapshot_state(
+                snapshot_bins, snapshot_best
+            ),
         }
         torch.save(items_to_save, logdir / "latest.pt")
         # A-1 interval snapshot (A15): latest.pt 직후 full ckpt를 step_{N}k.pt로 별도 보존.

@@ -79,6 +79,28 @@ def collect_eval_lap_times(evaldir, n_recent):
     return laps
 
 
+def pack_snapshot_state(snapshot_bins, snapshot_best):
+    """checkpoint 직렬화용 snapshot 상태 dict (B-1, 021 §6).
+
+    dreamer.py save 블록의 items_to_save["snapshot_state"]로 들어간다. 평범한 dict라
+    torch.save로 그대로 직렬화. bins={label:{lap_time,path}}, best={lap_time,path}.
+    """
+    return {"bins": snapshot_bins, "best": snapshot_best}
+
+
+def restore_snapshot_state(checkpoint):
+    """checkpoint에서 (snapshot_bins, snapshot_best) 복원 (B-1, 021 §6).
+
+    watchdog resume 시 메모리 {} 리셋으로 디스크 기존 policy_* 파일을 모른 채 재저장
+    → step suffix 다른 중복 누적. 이를 막기 위해 checkpoint["snapshot_state"]를 복원.
+    하위호환: "snapshot_state" 키 부재(구 ckpt) 시 ({}, {}). 항상 새 dict 반환(원본 미공유).
+    """
+    state = checkpoint.get("snapshot_state") if isinstance(checkpoint, dict) else None
+    if not state:
+        return {}, {}
+    return dict(state.get("bins", {})), dict(state.get("best", {}))
+
+
 def save_interval_snapshot(items_to_save, logdir, step_k, keep=True):
     """latest.pt 저장 직후 full ckpt를 step_{step_k}k.pt로 별도 복사(덮어쓰기 X, A15)."""
     if not keep:
@@ -118,15 +140,18 @@ def _unlink_if(old_path, keep_path):
 
 def update_diversity_snapshots(agent, lap_times, bins_state, best_state, logdir,
                                bin_width, lap_max, step_k):
-    """lap_times로 ① 10초 bin best ② global best 두 산출물을 갱신 저장.
+    """lap_times로 ① 트랙별 bin best ② run best(트랙별) 두 산출물을 갱신 저장.
 
     사용자 결정(2026-05-22):
-      ① diversity: bin_width(=10s) 고정 폭 구간(상한 lap_max=110)마다 최단 lap 1개.
+      ① diversity: bin_width 고정 폭 구간(상한 lap_max)마다 최단 lap 1개.
          파일 `policy_lap{X:.1f}s_step{Y}k.pt`, bin당 1개(더 빠르면 교체+옛 파일 삭제).
-      ② best: 전체 최단 lap policy 1개를 계속 갱신. 파일 `policy_best_lap{X:.1f}s_step{Y}k.pt`.
+      ② run best: 이 run(=logdir, 트랙별 process)의 최단 lap policy 1개를 계속 갱신.
+         파일 `policy_best_lap{X:.1f}s_step{Y}k.pt`.
+         B-2(021 §6): "run best"는 process/logdir 단위(트랙별)이지 전 트랙 통합 best가
+         아니다. 트랙 전환(Stage2)은 별도 logdir라 snapshot이 이미 독립 — 정상.
 
     bins_state: {label(상한): {"lap_time","path"}}, best_state: {"lap_time","path"}
-    (둘 다 호출 간 유지되는 mutable 누적 상태). 반환: 이번에 저장된 path 리스트.
+    (둘 다 호출 간 유지되는 mutable 누적 상태; B-1로 checkpoint에 persist). 반환: 저장 path 리스트.
     """
     logdir = pathlib.Path(logdir)
     saved = []
@@ -143,7 +168,7 @@ def update_diversity_snapshots(agent, lap_times, bins_state, best_state, logdir,
                 _unlink_if(prev["path"], path)
             bins_state[label] = {"lap_time": lt, "path": str(path)}
             saved.append(path)
-        # ② global best (계속 갱신)
+        # ② run best(트랙별, 계속 갱신) — 이 run(logdir) 단위 최단 lap (B-2).
         if not best_state or lt < best_state.get("lap_time", float("inf")):
             bpath = logdir / f"policy_best_lap{lt:.1f}s_step{int(step_k)}k.pt"
             save_inference_only(agent, bpath)

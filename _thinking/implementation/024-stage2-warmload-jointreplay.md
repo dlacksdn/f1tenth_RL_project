@@ -57,8 +57,37 @@ configs.yaml:77-80의 4키(warm_load_ckpt/warm_lr_scale/joint_replay_ratio/joint
   (train.log:649 "새 코드 resume 재기동 commit a448a6b"), crash 아님. grad_norm Inf/NaN 17/378
   ≈4.5% = precision16 GradScaler 정상 동작(발산 아님).
 
-## 다음 단계
-Stage1 성숙(≈500k) 후 그 모델로 Oschersleben **zero-shot 평가**:
-`python scripts/eval_gate.py --ckpt runs/stage1_map_easy3/latest.pt --task f1tenth_Oschersleben --gate A12,A13 --episodes 20`
-→ A12(완주율≥0.80)/A13(median≤120∧best≤110) 충족 시 fine-tune 불필요. 미달 시 A-2 정당화 →
-사용자 승인 하 Stage2 실행(warm_load_ckpt + joint_replay_dir/ratio CLI override, 별도 logdir).
+## 다음 단계 — ★ 운영 결정 변경 (2026-05-22, 사용자)
+**zero-shot 평가 게이트 폐기.** 사용자 판단: world model("세상 보는 눈")은 트랙 무관 재사용이
+warm-load의 전제이고, zero-shot은 "fine-tune이 필요한가" 측정일 뿐 전제조건이 아니다. 015 노선
+(의도적 적응)·목표(Oschersleben 주행시간)와 일치 → zero-shot 스킵하고 **바로 fine-tune**.
+
+**시점(GPU 제약으로 확정)**: GPU 8.2GB 중 Stage1이 5.2GB 점유(여유 2.7GB) → Stage2(~3.3GB) 동시
+실행은 OOM. 따라서 **Stage1 500k 완료 후** 그 성숙한 world model로 즉시 fine-tune(zero-shot만 스킵).
+eval_gate.py는 호출 안 함(코드 변경 불요).
+
+**실행 커맨드(검증 완료, 500k 도달 시 그대로 실행)**:
+```
+cd /home/dlacksdn/f1tenth_RL_project/vendor/dreamerv3-torch
+source /home/dlacksdn/f1tenth_RL_project/.venv/bin/activate
+python -u dreamer.py --configs f1tenth \
+  --task f1tenth_Oschersleben \
+  --logdir /home/dlacksdn/f1tenth_RL_project/runs/stage2_oschersleben \
+  --warm_load_ckpt /home/dlacksdn/f1tenth_RL_project/runs/stage1_map_easy3/latest.pt \
+  --warm_lr_scale 0.5 \
+  --joint_replay_dir /home/dlacksdn/f1tenth_RL_project/runs/stage1_map_easy3/train_eps \
+  --joint_replay_ratio 0.3 \
+  --envs 8 --parallel True --log_every 500
+```
+경로 검증(코드 증거):
+- `--task f1tenth_Oschersleben` → make_env `split("_",1)` → suite=f1tenth, task=Oschersleben →
+  `F1Tenth(task)`(f1tenth.py:52 `task==trackname`, Oschersleben 직접 지원). ✅
+- 새 logdir(runs/stage2_oschersleben)라 latest.pt 부재 → `_do_warm=True` 발동(resume 우선이라
+  crash 후 재기동 시엔 latest.pt resume). ✅
+- `joint_replay_dir`=Stage1 traindir(dreamer.py:224 `logdir/"train_eps"`, 현재 243 npz). Stage2
+  traindir(runs/stage2_oschersleben/train_eps)와 분리 = 옛/새 풀 분리. ✅
+- snapshot: dreamer.py:327 trackname="Oschersleben" → resolve_track_value lower 매칭 →
+  configs.yaml:219-220 oschersleben bin(10초폭/110s). ✅
+- 운영 파라미터(warm_lr_scale=0.5=R3, joint_replay_ratio=0.3)는 실행 시 최종 확정. #31: A16 미달 시 0.5.
+
+★ Stage1과 동시 실행 금지(OOM). Stage1 500k 종료 확인 후 시작.

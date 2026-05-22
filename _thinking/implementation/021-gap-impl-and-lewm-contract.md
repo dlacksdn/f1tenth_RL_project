@@ -109,3 +109,20 @@ LeWM 연계 방향: **(a) f1tenth 렌더 이미지 수집 파이프라인** vs *
 - 재시작: latest-resume(사용자 결정). watchdog 정지→학습 정지→latest.pt resume→watchdog 재기동(1회).
 - A-2(warm-load/joint replay), A-4(eval_gate.py)는 Stage 2 진입 전 별도 분기.
 - LeWM 연계(이미지 vs 변형) 별도 계획서.
+
+## 6. 정정/후속 (2026-05-22, §3 이후 결정 — append-only 보완)
+- **snapshot bin 트랙별 정정**(commit f13b7d3): §3의 "10초 고정 폭"을 **트랙별**로 변경.
+  map_easy3=(bin_width **1.0s**, lap_max **20s**), Oschersleben=(10s, 110s). 근거: map_easy3 실측
+  lap **~8–13s**(재시작 후 eval 8.06/10.28s)라 10초 폭은 변별력 부족. `snapshot_utils.resolve_track_value`로
+  트랙별 조회(configs.yaml의 `snapshot_bin_width`/`snapshot_lap_max`를 dict로). ★ 코드/config엔 반영,
+  **실행 중 run엔 재시작 전이라 미적용**(다음 분기 작업 후 일괄 재시작 시 반영).
+- **global best 범위 명확화**: `snapshot_best`는 `main()` run마다 `{}` 초기화(dreamer.py:322) =
+  **run(logdir/task) 단위 "전 step 통합 최단"**이지 트랙 통합 아님. Stage1(map_easy3)/Stage2
+  (Oschersleben, 별도 logdir·process)는 best 독립 → easy 8s가 osch best 기준이 되지 않음(정상).
+  단 명칭 오해 소지 → 다음 분기에 "run best" 명칭/주석 정정 예정.
+- **resume persist 미구현(약점)**: `snapshot_bins/best`가 메모리 dict라 watchdog resume 시 `{}`로
+  리셋 → 디스크 기존 파일 모른 채 재저장(step suffix 다른 중복 누적 가능). 다음 분기에 latest.pt
+  `snapshot_state` 저장/복원으로 개선 예정.
+- **재시작 1회 완료**: 9659fc5 코드로 latest-resume(step~149k, value_mean 상승). diversity+best
+  snapshot 실생성 확인(`policy_best_lap8.1s`, partial ~48MB) = 전 파이프라인 작동 검증.
+- **다음 분기**: A-4 eval_gate.py + snapshot persist/명칭 정정 → 일괄 재시작(022 기록 예정).

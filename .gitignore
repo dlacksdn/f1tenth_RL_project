@@ -58,3 +58,5 @@ replay/
 # _thinking/notes/             ← 측정 결과, 재측정 비용 → commit
 #
 # /home/dlacksdn/dreamerv3-torch/  ← 외부 디렉토리, 본 repo 무관. 별도 동기화.
+# 동영상 산출물(로컬 보존, _thinking/KEEP)
+*.mp4

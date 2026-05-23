@@ -144,13 +144,28 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--logdir", default="runs/stage1_map_easy3")
     ap.add_argument("--ckpt", default=None, help="기본: <logdir>/latest.pt")
+    ap.add_argument("--best", action="store_true",
+                    help="logdir의 현재 run best(policy_best_lap*.pt)를 자동 선택. "
+                         "더 빠른 lap이 나와 파일명이 바뀌어도 항상 최신 best를 시연(latest.pt는 best 아님).")
     ap.add_argument("--episodes", type=int, default=3)
     ap.add_argument("--mode", default="human", choices=["human", "human_fast"])
     ap.add_argument("--task", default=None, help="task override (예: f1tenth_oschersleben)")
     args = ap.parse_args()
 
     logdir = (PROJECT_ROOT / args.logdir).resolve() if not os.path.isabs(args.logdir) else pathlib.Path(args.logdir)
-    ckpt_src = pathlib.Path(args.ckpt) if args.ckpt else (logdir / "latest.pt")
+    # ckpt 우선순위: 명시(--ckpt) > best 자동(--best) > latest.pt
+    if args.ckpt:
+        ckpt_src = pathlib.Path(args.ckpt)
+    elif args.best:
+        # run best는 더 빠른 lap마다 policy_best_lap{X}s_step{Y}k.pt로 교체되므로(파일명 가변)
+        # 가장 최근 갱신(mtime 최신) 1개를 자동 선택 → 항상 현재 best 반영.
+        cands = sorted(logdir.glob("policy_best_lap*.pt"), key=lambda p: p.stat().st_mtime)
+        if not cands:
+            raise FileNotFoundError(f"best 스냅샷 없음: {logdir}/policy_best_lap*.pt")
+        ckpt_src = cands[-1]
+        print(f"[watch] --best 자동 선택: {ckpt_src.name}")
+    else:
+        ckpt_src = logdir / "latest.pt"
     if not ckpt_src.exists():
         raise FileNotFoundError(f"체크포인트 없음: {ckpt_src}")
 
@@ -176,7 +191,14 @@ def main():
     agent = Dreamer(obs_space, act_space, config, logger, dataset=None).to(config.device)
     agent.requires_grad_(False)
     ckpt = torch.load(snap, map_location="cpu")
-    agent.load_state_dict(ckpt["agent_state_dict"])
+    # strict=False: policy_*.pt(partial=_wm+actor)는 critic/value 키가 없다. 시연(주행)은
+    # actor.mode() + world model latent만 쓰고 critic은 imagination 학습에만 쓰이므로,
+    # missing key를 무시하고 로드해도 추론 정상. full ckpt면 missing 0이라 동일.
+    missing, unexpected = agent.load_state_dict(ckpt["agent_state_dict"], strict=False)
+    n_actor_critic_missing = sum(1 for k in missing if ".value" in k or "_slow_value" in k)
+    if missing or unexpected:
+        print(f"[watch] partial 로드: missing={len(missing)}키"
+              f"(critic/value {n_actor_critic_missing} 등, 주행 무관) unexpected={len(unexpected)}")
     agent.eval()
     print("[watch] 모델 로드 완료. 실시간 창을 띄웁니다 (창이 안 뜨면 메시지를 확인하세요).")
 

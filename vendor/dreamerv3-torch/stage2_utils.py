@@ -27,18 +27,29 @@ def extract_warm_state(agent_state_dict):
     return {k: v for k, v in agent_state_dict.items() if k.startswith("_wm.")}
 
 
-def joint_episode_generator(gen_old, gen_new, ratio, seed=0):
+def joint_episode_generator(gen_old, gen_new, ratio, seed=0, new_episodes=None):
     """두 episode generator를 ratio로 섞는다.
 
     매 yield마다 rng.rand() < ratio면 gen_old(Stage1), 아니면 gen_new(현 트랙).
     seed 고정으로 재현 가능(통계적 비율 = ratio).
+
+    hang 가드(027 권장안 b): gen_new 분기로 결정됐어도 new_episodes(=train_eps)에
+    len≥2 에피소드가 1개도 없으면(미성숙) 그 yield를 gen_old로 우회한다. gen_new가
+    참조하는 tools.sample_episodes는 모든 에피소드 len<2면 무한 루프(tools.py:339-341)
+    이므로, Stage2 첫 train 시점(빈/len1 train_eps)에 hang을 차단한다. gen_old(Stage1
+    풀)는 항상 len≥2라 안전. train_eps가 성숙(len≥2 1개+)하면 의도된 ratio로 자동 복귀.
+    new_episodes=None(기존 호출 경로)이면 가드 비활성 → 하위호환·회귀 0.
     """
     rng = np.random.RandomState(seed)
     while True:
-        if rng.rand() < ratio:
-            yield next(gen_old)
-        else:
-            yield next(gen_new)
+        use_old = rng.rand() < ratio
+        if not use_old and new_episodes is not None:
+            has_valid = any(
+                len(next(iter(ep.values()))) >= 2 for ep in new_episodes.values()
+            )
+            if not has_valid:
+                use_old = True  # train_eps 미성숙 → 안전한 gen_old로 우회
+        yield next(gen_old) if use_old else next(gen_new)
 
 
 def make_joint_dataset(episodes, stage1_episodes, config):
@@ -50,6 +61,7 @@ def make_joint_dataset(episodes, stage1_episodes, config):
     gen_new = tools.sample_episodes(episodes, config.batch_length)
     gen_old = tools.sample_episodes(stage1_episodes, config.batch_length)
     gen = joint_episode_generator(
-        gen_old, gen_new, config.joint_replay_ratio, config.seed
+        gen_old, gen_new, config.joint_replay_ratio, config.seed,
+        new_episodes=episodes,
     )
     return tools.from_generator(gen, config.batch_size)

@@ -68,3 +68,13 @@ python -u dreamer.py --configs f1tenth --task f1tenth_Oschersleben \
 ## 다음 단계
 Stage2 시작 후: snapshot(Oschersleben bin 10초폭/110s) + eval로 주행시간 추이 모니터.
 충분한 주행시간 도달 시 조기 종료 판단(사용자 보고). forgetting/적응속도 보고 lr·ratio 재조정 여지.
+
+## ★ Stage2 실제 시작 (2026-05-23 13:07)
+Stage1 516k에서 수동 종료 → Oschersleben zero-shot 진단(026: 감속 못함=속도 정책 과적합)
+→ 사용자 "바로 Oschersleben 학습" 결정 → stage2_watchdog.sh 기동.
+- 검증 로그(train.log): joint 0.3(355 stage1 eps 로드, dataset_size 200k 제한), lr×0.5
+  (model 5e-5/actor·critic 1.5e-5), warm-load 104 _wm.* keys unexpected=0 _wm-missing=0
+  (actor/critic/optim fresh). 첫 eval -2.7 collision(actor fresh 당연).
+- dreamer pid 6445, logdir=runs/stage2_oschersleben(원본 stage1 불변), watchdog 생존(crash resume).
+- 멀티맵 기대(joint 0.3로 map_easy3도?): 가능성 있으나 보장 X(30%<100% 학습량/정책 상충/
+  Stage2 eval은 Oschersleben만). 확인하려면 Stage2 후 map_easy3 별도 eval.

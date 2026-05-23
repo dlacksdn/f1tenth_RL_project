@@ -19,18 +19,23 @@
   - crash(프로세스 없음 + step<500k)면 조건 미충족 → train_watchdog가 resume → 폴링 계속 대기.
 - 조건 충족 시 background 종료 → harness가 Claude를 1회 재호출.
 
-### 2) 재호출 시 Claude 절차 (★ 깨어나면 이대로)
-1. Stage1 프로세스 부재 + last_step≥500k 재확인(이중 안전).
-2. GPU 여유 확인(nvidia-smi — Stage1 반환으로 충분히 비었는지).
-3. `scripts/stage2_watchdog.sh`를 detached 기동:
-   ```
-   cd /home/dlacksdn/f1tenth_RL_project
-   setsid nohup ./scripts/stage2_watchdog.sh \
-     > runs/stage2_oschersleben/watchdog.log 2>&1 < /dev/null &
-   ```
-4. ~1분 후 Stage2 dreamer 생존(pid) + train.log의 `[warm-load] loaded N _wm.* keys` +
-   `[joint-replay] ratio=0.3` 로그 확인.
-5. 사용자에게 보고(시작 시각/pid/warm-load·joint 로그/초기 step).
+### 2) 재호출 시 Claude 절차 (★★ 계획 변경 2026-05-23 — Stage2 자동 시작 보류!)
+**배경**: Stage1 후반(429k~469k) eval 5연속 완주 실패(completed=0, lap_time 7s = 같은
+지점 반복 실패). 사용자 결정: "바로 Stage2 넘어가는 건 아닌 것 같다. 500k 찍으면 방향성 고민."
+→ **stage2_watchdog 자동 기동 금지.** 깨어나면 측정+보고만 하고 사용자와 방향 논의.
+
+깨어나면 이대로:
+1. Stage1 프로세스 부재 + last_step≥500k 재확인. GPU 반환 확인(nvidia-smi).
+2. 최종 그래프 생성: `python scripts/plot_returns.py --logdir runs/stage1_map_easy3
+   --title "Stage1 final 0~500k"` → return_curve-N.png(0~500k 전체).
+3. **eval_gate로 완주율 정밀 측정**(metrics의 듬성한 0/1보다 신뢰도↑):
+   `python scripts/eval_gate.py --ckpt runs/stage1_map_easy3/latest.pt
+    --task f1tenth_map_easy3 --gate A11 --episodes 20`
+   → 완주율(A11≥0.80?) + median/best lap_time. ★ GPU 비었으니 실행 가능.
+4. 가능하면 어느 지점에서 실패하는지(lap_time 7s 지점) 단서 수집.
+5. 사용자에게 보고 + 방향성 옵션 제시(예: 추가 학습/snapshot 중 best 선택/reward·시작위치
+   재검토/그래도 Stage2). **Stage2는 사용자 명시 승인 후에만.**
+- stage2_watchdog.sh는 보존하되 자동 기동 안 함(방향 확정 시 수동 사용).
 
 ## scripts/stage2_watchdog.sh (커밋 1198b68 직후 추가)
 - Stage1 train_watchdog.sh 패턴 + warm-load/joint 인자. start_train은 항상 풀 커맨드:

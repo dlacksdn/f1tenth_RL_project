@@ -1,5 +1,13 @@
 # [핸드오프] 주행 동영상 저장 작업 — 새 세션용 (2026-05-23)
 
+> ✅ **완료(2026-05-24).** scripts/record_drive.py 신규 작성·녹화 완료. mp4는 _thinking/KEEP/에
+> 로컬 보존(*.mp4 gitignore라 git 제외): map_easy3_best_drive.mp4, oscher_best_drive.mp4.
+> 사용자 확인: 2바퀴 잘 주행·기록 좋아 유지. 단 ★oscher는 --best(=lap-best 16.6초/policy 85step)로
+> 추정 생성 — 사용자가 best로 지정한 eval-best(eval_return 336/policy 80step=step_80k.pt)와는 다름
+> (lap_time 기준 vs eval_return 기준, 030 참조). 현 동영상 그대로 유지하기로 함.
+> 아래는 작업 당시 핸드오프 원문(참고용).
+>
+> ---
 > 이전 세션 컨텍스트가 길어져 동영상 작업을 새 세션으로 넘김. 아래만 보면 바로 착수 가능.
 > 학습은 정지 상태(029 참조). 이 작업은 학습과 무관(시연/녹화만).
 

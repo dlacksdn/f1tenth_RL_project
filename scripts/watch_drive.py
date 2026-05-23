@@ -25,6 +25,7 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 VENDOR = PROJECT_ROOT / "vendor" / "dreamerv3-torch"
 sys.path.insert(0, str(VENDOR))
 
+import numpy as np  # noqa: E402
 import ruamel.yaml as yaml  # noqa: E402
 import torch  # noqa: E402
 
@@ -94,6 +95,19 @@ class RenderDamy:
         self._ep_idx = 0
 
     def step(self, action):
+        # 정책 action은 정규화([-1,1]) — NormalizeActions(dreamer.py:55)가 raw로 변환해 들어감.
+        # 여기선 변환 전이라 f1tenth raw scale로 환산해 실시간 출력
+        # (steer [-0.4189,0.4189]rad, speed [-5,20]m/s — f1tenth_env.py:35-36/183-184).
+        a = action["action"] if isinstance(action, dict) else action
+        a = np.asarray(a, dtype=np.float32).reshape(-1)
+        steer = float(a[0]) * 0.4189
+        speed = (float(a[1]) + 1.0) / 2.0 * 25.0 - 5.0
+        print(
+            f"[drive] steer={steer:+.3f} rad  speed={speed:6.2f} m/s   "
+            f"(norm: {a[0]:+.2f}, {a[1]:+.2f})",
+            flush=True,
+        )
+
         promise = self._damy.step(action)
 
         def wrapped():

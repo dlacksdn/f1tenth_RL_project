@@ -261,6 +261,9 @@ def main():
     ap.add_argument("--task", required=True,
                     choices=["f1tenth_map_easy3", "f1tenth_Oschersleben"])
     ap.add_argument("--episodes", type=int, default=20)
+    ap.add_argument("--v_max", type=float, default=None,
+                    help="action-space 속도상한(m/s). 캡 정책 평가 시 학습값과 일치 "
+                         "(예: cap-15 정책 → --v_max 15). 미지정 시 config 기본(20).")
     ap.add_argument("--gate", default=None,
                     help="쉼표 구분 게이트(기본: task별). 예: A11,A16 / A12,A13")
     ap.add_argument("--logdir", default=None,
@@ -275,6 +278,8 @@ def main():
         raise FileNotFoundError(f"체크포인트 없음: {ckpt_path}")
 
     config = build_config(args.task)
+    if args.v_max is not None:
+        config.v_max = args.v_max  # 캡 정책 평가: 학습 action space와 일치(NormalizeActions 매핑 보정)
     print(f"[eval_gate] task={args.task} episodes={args.episodes} gates={gates} "
           f"ckpt={ckpt_path}", flush=True)
     agent, env = load_agent(config, ckpt_path)

@@ -86,10 +86,11 @@ class RenderDamy:
 
     물리/관측/보상에는 일절 개입하지 않는다 — 출력(렌더)과 에피소드 요약만 추가."""
 
-    def __init__(self, damy, f110, mode):
+    def __init__(self, damy, f110, mode, v_max=20.0):
         self._damy = damy
         self._f110 = f110
         self._mode = mode
+        self._v_max = float(v_max)
         self._ep_return = 0.0
         self._ep_len = 0
         self._ep_idx = 0
@@ -101,7 +102,8 @@ class RenderDamy:
         a = action["action"] if isinstance(action, dict) else action
         a = np.asarray(a, dtype=np.float32).reshape(-1)
         steer = float(a[0]) * 0.4189
-        speed = (float(a[1]) + 1.0) / 2.0 * 25.0 - 5.0
+        # raw speed = NormalizeActions 역매핑: [-1,1] -> [V_MIN(-5), v_max]
+        speed = (float(a[1]) + 1.0) / 2.0 * (self._v_max + 5.0) - 5.0
         print(
             f"[drive] steer={steer:+.3f} rad  speed={speed:6.2f} m/s   "
             f"(norm: {a[0]:+.2f}, {a[1]:+.2f})",
@@ -149,7 +151,10 @@ def main():
                          "더 빠른 lap이 나와 파일명이 바뀌어도 항상 최신 best를 시연(latest.pt는 best 아님).")
     ap.add_argument("--episodes", type=int, default=3)
     ap.add_argument("--mode", default="human", choices=["human", "human_fast"])
-    ap.add_argument("--task", default=None, help="task override (예: f1tenth_oschersleben)")
+    ap.add_argument("--task", default=None, help="task override (예: f1tenth_Oschersleben)")
+    ap.add_argument("--v_max", type=float, default=None,
+                    help="action-space 속도상한(m/s). 캡 정책 시연 시 학습값과 일치시킬 것 "
+                         "(예: cap-15 정책이면 --v_max 15). 미지정 시 config 기본(20).")
     args = ap.parse_args()
 
     logdir = (PROJECT_ROOT / args.logdir).resolve() if not os.path.isabs(args.logdir) else pathlib.Path(args.logdir)
@@ -176,12 +181,14 @@ def main():
 
     config = build_config(task_override=args.task)
     config.logdir = str(logdir)
+    if args.v_max is not None:
+        config.v_max = args.v_max  # 캡 정책 시연: 학습 action space와 일치(NormalizeActions 매핑 보정)
 
     logger = tools.Logger(pathlib.Path("/tmp/watch_drive_log"), 0)
 
     env = make_env(config, "eval", 0)
     f110 = find_f110(env)
-    renv = RenderDamy(Damy(env), f110, args.mode)
+    renv = RenderDamy(Damy(env), f110, args.mode, config.v_max)
 
     obs_space = renv.observation_space
     act_space = renv.action_space

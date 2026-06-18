@@ -204,7 +204,7 @@ def make_env(config, mode, id):
     elif suite == "f1tenth":  # f1tenth fork-patch (decision #22/#25, Phase 2-0)
         from envs.f1tenth import F1Tenth
 
-        env = F1Tenth(task, config.action_repeat, seed=config.seed + id)
+        env = F1Tenth(task, config.action_repeat, seed=config.seed + id, v_max=config.v_max)
         env = wrappers.NormalizeActions(env)
     else:
         raise NotImplementedError(suite)

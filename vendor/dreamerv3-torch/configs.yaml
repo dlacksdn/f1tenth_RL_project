@@ -24,6 +24,7 @@ defaults:
   size: [64, 64]
   envs: 1
   action_repeat: 2
+  v_max: 20.0  # f1tenth action-space forward-speed upper bound (m/s). 20.0 = unchanged Dreamer behavior; speed-cap runs override via --v_max (Diffuser data-collection policies). f1tenth suite only.
   time_limit: 1000
   grayscale: False
   prefill: 2500

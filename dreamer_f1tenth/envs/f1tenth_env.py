@@ -215,6 +215,14 @@ class F110GymnasiumWrapper(gymnasium.Env):
         "log_reward_lap",
         "log_lap_count_arc",     # 현재 누적 lap 수(진단; npz per-step 추적용)
         "log_completed",         # lap_complete(2-lap) 종료 step에 1.0; 그 외 0
+        # Diffuser P2(planning/005 §5·§6): world pose 진단 채널. raw poses_x/y/theta[0]를
+        # log_ 키로 노출 → simulate/run_episode가 encoder 입력에서 strip(tools.py:167,
+        # eval_gate.py:183) → WM/물리/reward/판정 무영향. transition=o.copy()로 npz 보존.
+        # collect_crash_data.py가 npz의 이 3키를 stack→pose(T,3)로 만든다(env.unwrapped
+        # ._raw_obs는 어댑터가 gym.Wrapper 미상속이라 끊김 — 이 채널이 견고한 경로).
+        "log_pose_x",            # world x = raw["poses_x"][0]
+        "log_pose_y",            # world y = raw["poses_y"][0]
+        "log_pose_theta",        # world yaw = raw["poses_theta"][0]
     )
 
     def _build_obs(self, raw, is_first=False, is_terminal=False, is_last=False,
@@ -296,8 +304,16 @@ class F110GymnasiumWrapper(gymnasium.Env):
         self._lap_count_arc = 0
         self._lap_start_step = 0
 
-        # is_first transition: log_ 키는 기본 0(log_fields=None) → 전 transition 키 일관성.
-        obs = self._build_obs(raw, is_first=True, is_terminal=False, is_last=False)
+        # is_first transition: log_ 키는 기본 0이되 world pose만 reset 시점 실제값 주입
+        # (collect_crash_data.py가 pose(T,3) 첫 행으로 사용; 다른 log_ 키는 0 유지).
+        obs = self._build_obs(
+            raw, is_first=True, is_terminal=False, is_last=False,
+            log_fields={
+                "log_pose_x": float(raw["poses_x"][0]),
+                "log_pose_y": float(raw["poses_y"][0]),
+                "log_pose_theta": float(raw["poses_theta"][0]),
+            },
+        )
         info = {"cause": None, "trackname": self.trackname, "env_step": 0}
         return obs, info
 
@@ -444,6 +460,10 @@ class F110GymnasiumWrapper(gymnasium.Env):
             "log_reward_lap": lap_r,
             "log_lap_count_arc": float(self._lap_count_arc),
             "log_completed": 1.0 if cause == "lap_complete" else 0.0,
+            # world pose 진단(Diffuser P2): pos/yaw는 위 L328-329에서 이미 계산됨.
+            "log_pose_x": float(pos[0]),
+            "log_pose_y": float(pos[1]),
+            "log_pose_theta": yaw,
         }
         obs = self._build_obs(raw, is_first=False, is_terminal=is_terminal,
                               is_last=is_last, log_fields=log_fields)

@@ -87,6 +87,21 @@ def _pose(env, obs):
     return _pose_from_chain(env)
 
 
+def _pose_req(obs):
+    """배치 경로 전용: log_pose_* 필수 추출(없으면 무결성 에러).
+
+    배치 env(Damy/Parallel)는 .env 체인 폴백(_pose_from_chain)이 Parallel 프로세스
+    분리로 끊기므로 log_pose_* 채널만 신뢰한다. f1tenth_env.py가 reset/step 모두
+    log_pose_x/y/theta를 주입(L309-316/L464-466)하므로 항상 존재해야 정상.
+    """
+    p = _pose_from_obs(obs)
+    if p is None:
+        raise RuntimeError(
+            "log_pose_* 부재 — env가 log_pose 채널을 주입하지 않음(배치 pose 무결성 실패)."
+        )
+    return p
+
+
 # ---------------------------------------------------------------------------
 # collect_episode — tools.simulate(L150-199) 정렬 미러
 # ---------------------------------------------------------------------------
@@ -166,6 +181,114 @@ def collect_episode(agent, env, v_max):
 
 
 # ---------------------------------------------------------------------------
+# collect_batch — tools.simulate(L150-205) 배치 루프 미러 (GPU envs=N)
+# ---------------------------------------------------------------------------
+def collect_batch(agent, envs, v_max, target_attempts, out_dir, save_complete):
+    """N개 env 배치 stochastic rollout → 충돌(+옵션 완주) ep 저장.
+
+    ``tools.simulate``(tools.py:150-205)의 배치 루프를 100% 미러하되 (1) ``_policy``
+    직접 호출로 _train 우회(collect_episode와 동일 이유: dataset=None), (2) transition
+    마다 pose/v_max 주입, (3) done ep를 cause로 필터(collision; save_complete 시
+    lap_complete 포함)한다.
+
+    추론은 episode 독립이라 obs를 (N,...)로 stack해 한 번에 배치 추론(GPU 활용) =
+    단일 env 직렬 대비 N배 처리량. env.step은 Damy(메인 직렬)/Parallel(프로세스 병렬).
+    각 env done은 독립이며, reset된 env obs의 is_first=True가 _policy의 obs_step에서
+    그 env latent만 리셋(agent_state는 배치로 유지) → 단일 경로와 동일 정책 분포.
+
+    정렬(simulate 미러 = train_eps 동일):
+      reset transition (L156-163): obs.copy() + reward=0.0 + discount=1.0 (+pose/v_max).
+      step  transition (L189-199): step후 obs.copy() + a(action+logprob) + reward + discount.
+      add_to_cache(L256-268)가 action/logprob 첫 등장 시 reset 위치에 0-패딩.
+
+    반환: (n_collision, n_complete, n_other, attempts).
+    """
+    import torch
+    import tools
+
+    n_env = len(envs)
+    cache = {}
+    done = np.ones(n_env, bool)          # 전부 done → 첫 루프에서 전부 reset (simulate L143)
+    obs = [None] * n_env
+    agent_state = None
+
+    n_collision = 0
+    n_complete = 0
+    n_other = {}
+    attempts = 0
+
+    while attempts < target_attempts:
+        # 1. done env reset (simulate L152-165): 새 UUID로 reset transition 시작.
+        if done.any():
+            idx = [i for i, d in enumerate(done) if d]
+            results = [envs[i].reset() for i in idx]
+            results = [r() for r in results]              # Damy/Parallel promise resolve
+            for i, res in zip(idx, results):
+                t = {k: tools.convert(v) for k, v in res.items()}
+                t["reward"] = 0.0
+                t["discount"] = 1.0
+                t["pose"] = _pose_req(res)                # reset 시점 pose (log_pose_*)
+                t["v_max"] = np.float32(v_max)
+                tools.add_to_cache(cache, envs[i].id, t)
+                obs[i] = res
+
+        # 2. 배치 추론 (simulate L167-176): log_ 키 제외 stack → _policy 한 번(GPU 배치).
+        obs_batch = {k: np.stack([o[k] for o in obs]) for k in obs[0] if "log_" not in k}
+        with torch.no_grad():
+            action, agent_state = agent._policy(obs_batch, agent_state, training=True)
+        action = [
+            {k: np.array(action[k][i].detach().cpu()) for k in action}
+            for i in range(n_env)
+        ]
+
+        # 3. env step (simulate L178-183).
+        results = [e.step(a) for e, a in zip(envs, action)]
+        results = [r() for r in results]
+        obs, _, done = zip(*[p[:3] for p in results])
+        obs = list(obs)
+        done = np.stack(done)
+
+        # 4. step transition per env (simulate L189-199) + pose/v_max.
+        for a, result, env in zip(action, results, envs):
+            o, r, d, info = result
+            transition = {k: tools.convert(v) for k, v in o.items()}
+            transition.update(a)                          # action + logprob (train_eps 동일)
+            transition["reward"] = r
+            transition["discount"] = info.get("discount", np.array(1 - float(d)))
+            transition["pose"] = _pose_req(o)             # step후 pose
+            transition["v_max"] = np.float32(v_max)
+            tools.add_to_cache(cache, env.id, transition)
+
+        # 5. done ep 필터/저장 (simulate L201-205 자리 = collect 충돌필터).
+        if done.any():
+            idx = [i for i, d in enumerate(done) if d]
+            for i in idx:
+                ep_id = envs[i].id                         # reset 전이라 끝난 ep의 id
+                cause = results[i][3].get("cause")
+                length = len(cache[ep_id]["reward"])
+                attempts += 1
+                saved = False
+                if cause == "collision":
+                    tools.save_episodes(out_dir, {ep_id: cache[ep_id]})
+                    n_collision += 1
+                    saved = True
+                elif cause == "lap_complete":
+                    n_complete += 1
+                    if save_complete:
+                        tools.save_episodes(out_dir, {ep_id: cache[ep_id]})
+                        saved = True
+                else:
+                    key = str(cause)
+                    n_other[key] = n_other.get(key, 0) + 1
+                print(f"[collect] attempt {attempts}/{target_attempts} env{i}: "
+                      f"cause={cause} len={length} saved={saved} "
+                      f"(collision={n_collision} complete={n_complete})", flush=True)
+                del cache[ep_id]                           # 저장/폐기 후 즉시 해제(메모리)
+
+    return n_collision, n_complete, n_other, attempts
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def main():
@@ -187,12 +310,21 @@ def main():
                     help="충돌 npz 저장 디렉터리(mkdir -p). tier별 분리 권장.")
     ap.add_argument("--save-complete", action="store_true", default=False,
                     help="저속 tier(cap-5/10) 전용: collision뿐 아니라 lap_complete ep도 저장. "
-                         "미지정(기본 False)=기존 충돌-only 동작 100% 불변. "
+                         "미지정(기본 False)=기존 충돌-only 동작 100%% 불변. "
                          "diverged/reverse/timeout/None은 여전히 폐기.")
     ap.add_argument("--max-env-steps", type=int, default=None,
                     help="지정 시 build_config 후 config.time_limit 오버라이드(env-step 단위). "
                          "배회 ep 조기 truncate용. 미지정(기본 None)=config.time_limit 유지. "
                          "완주 ep가 안 끊기게 cap-5/10은 9000 권장(=180s @action_repeat).")
+    ap.add_argument("--envs", type=int, default=1,
+                    help="동시 env 수(배치 추론). 1=기존 단일 직렬 경로(완전 불변). "
+                         ">1=collect_batch(GPU 배치 추론 권장). 각 env seed=config.seed+i.")
+    ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
+                    help="추론 device. 단일(envs=1)은 cpu 권장(배치1=비효율, CPU↔GPU 전송). "
+                         "배치(envs>1)는 cuda 권장(N-배치 GPU 추론으로 처리량↑).")
+    ap.add_argument("--parallel", action="store_true", default=False,
+                    help="배치 env.step을 별도 프로세스로 병렬화(Parallel, spawn). "
+                         "미지정=Damy(메인 프로세스 직렬 step). 추론은 항상 메인 GPU 배치.")
     args = ap.parse_args()
 
     ckpt_path = pathlib.Path(args.ckpt)
@@ -210,61 +342,87 @@ def main():
     config = build_config(args.task)        # eval_state_mean=True, device=cpu, precision=32
     config.eval_state_mean = False          # latent stochastic (_policy L96 분기 skip)
     config.v_max = args.v_max               # action space high (load_agent의 make_env 전 확정 필수)
-    config.device = "cpu"                    # 학습 GPU 무경쟁, 4 tier 동시
+    config.device = args.device              # cpu(단일/동시) 또는 cuda(배치 추론)
+    config.envs = args.envs                  # 배치 env 수(make_env 호출 횟수)
+    config.parallel = args.parallel          # 배치 step 병렬화(Parallel) 여부
     if args.max_env_steps is not None:      # 배회 ep 조기 truncate(완주 ep는 안 끊기게 9000 권장)
         config.time_limit = args.max_env_steps  # make_env 전 확정 필수(TimeLimit 래퍼가 읽음)
 
     print(f"[collect] task={args.task} ckpt={ckpt_path} v_max={args.v_max} "
           f"episodes={args.episodes} out={out_dir}", flush=True)
     print(f"[collect] eval_state_mean={config.eval_state_mean} device={config.device} "
-          f"(stochastic latent+action)", flush=True)
+          f"envs={args.envs} parallel={args.parallel} (stochastic latent+action)", flush=True)
     print(f"[collect] save_complete={args.save_complete} "
           f"max_env_steps={args.max_env_steps} time_limit={config.time_limit}", flush=True)
 
     import tools
-    agent, env = load_agent(config, ckpt_path)  # 내부 make_env → config.num_actions 세팅
+    agent, env = load_agent(config, ckpt_path)  # 내부 make_env(eval,0) → config.num_actions 세팅
 
-    # ★ stochastic policy 호출 규약.
-    # Dreamer.__call__(dreamer.py:60-86)은 training=True 시 self._train(next(self._dataset))
-    # 를 돌리는데(L62-69) 수집에는 dataset=None → 'NoneType is not an iterator' 크래시.
-    # _policy(dreamer.py:88-123)를 직접 호출하면 train 루프를 우회하면서 stochastic 분기
-    # (eval_state_mean=False → latent sample L96 skip; training=True → action sample
-    # L105 not-training skip → L108/L110 또는 L113 sample. expl_until=0이라 _should_expl는
-    # 항상 True지만 expl_behavior='greedy'=task_behavior라 결과 동일)만 취한다.
-    # __call__과 동일한 (obs, reset, state) 시그니처로 감싼다(reset 인자는 _policy 미사용).
-    def collect_policy(obs, reset, state=None):
-        return agent._policy(obs, state, training=True)
+    if args.envs == 1:
+        # ===== 단일 직렬 경로 (기존; 100% 불변, 검증완료 데이터 출처) =====
+        # ★ stochastic policy 호출 규약.
+        # Dreamer.__call__(dreamer.py:60-86)은 training=True 시 self._train(next(self._dataset))
+        # 를 돌리는데(L62-69) 수집에는 dataset=None → 'NoneType is not an iterator' 크래시.
+        # _policy(dreamer.py:88-123)를 직접 호출하면 train 루프를 우회하면서 stochastic 분기
+        # (eval_state_mean=False → latent sample L96 skip; training=True → action sample
+        # L105 not-training skip → L108/L110 또는 L113 sample. expl_until=0이라 _should_expl는
+        # 항상 True지만 expl_behavior='greedy'=task_behavior라 결과 동일)만 취한다.
+        # __call__과 동일한 (obs, reset, state) 시그니처로 감싼다(reset 인자는 _policy 미사용).
+        def collect_policy(obs, reset, state=None):
+            return agent._policy(obs, state, training=True)
 
-    n_collision = 0   # 저장
-    n_complete = 0    # 완주 폐기
-    n_other = {}      # diverged/reverse/timeout/None 등 폐기 카운트
+        n_collision = 0   # 저장
+        n_complete = 0    # 완주(폐기 또는 save_complete 저장)
+        n_other = {}      # diverged/reverse/timeout/None 등 폐기 카운트
 
-    try:
-        for i in range(args.episodes):
-            cache, ep_id, cause, length = collect_episode(collect_policy, env, args.v_max)
-            saved = False
-            if cause == "collision":
-                tools.save_episodes(out_dir, {ep_id: cache[ep_id]})  # {ep_id}-{length}.npz
-                n_collision += 1
-                saved = True
-            elif cause == "lap_complete":
-                n_complete += 1
-                # --save-complete 시 완주 ep도 저장(저속 tier=느린완주라 BC위험 없음 + 다양성).
-                # 미지정 시 기존대로 폐기(동작 불변).
-                if args.save_complete:
+        try:
+            for i in range(args.episodes):
+                cache, ep_id, cause, length = collect_episode(collect_policy, env, args.v_max)
+                saved = False
+                if cause == "collision":
                     tools.save_episodes(out_dir, {ep_id: cache[ep_id]})  # {ep_id}-{length}.npz
+                    n_collision += 1
                     saved = True
-            else:
-                key = str(cause)
-                n_other[key] = n_other.get(key, 0) + 1
-            print(f"[collect] ep {i + 1}/{args.episodes}: cause={cause} len={length} "
-                  f"saved={saved} (collision={n_collision} complete={n_complete})", flush=True)
-            del cache  # ep마다 새 cache → 메모리 누수 방지
-    finally:
+                elif cause == "lap_complete":
+                    n_complete += 1
+                    # --save-complete 시 완주 ep도 저장(저속 tier=느린완주라 BC위험 없음 + 다양성).
+                    # 미지정 시 기존대로 폐기(동작 불변).
+                    if args.save_complete:
+                        tools.save_episodes(out_dir, {ep_id: cache[ep_id]})  # {ep_id}-{length}.npz
+                        saved = True
+                else:
+                    key = str(cause)
+                    n_other[key] = n_other.get(key, 0) + 1
+                print(f"[collect] ep {i + 1}/{args.episodes}: cause={cause} len={length} "
+                      f"saved={saved} (collision={n_collision} complete={n_complete})", flush=True)
+                del cache  # ep마다 새 cache → 메모리 누수 방지
+        finally:
+            try:
+                env.close()
+            except Exception:
+                pass
+    else:
+        # ===== 배치 경로 (collect_batch, GPU 배치 추론) =====
+        # load_agent의 단일 env(eval,0)는 불필요 → 닫고 envs=N 벡터 생성(dreamer.py:250-258 패턴).
         try:
             env.close()
         except Exception:
             pass
+        from dreamer import make_env
+        from parallel import Parallel, Damy
+        envs = [make_env(config, "eval", i) for i in range(args.envs)]  # seed=config.seed+i
+        envs = ([Parallel(e, "process") for e in envs]
+                if args.parallel else [Damy(e) for e in envs])
+        try:
+            n_collision, n_complete, n_other, _attempts = collect_batch(
+                agent, envs, args.v_max, args.episodes, out_dir, args.save_complete
+            )
+        finally:
+            for e in envs:
+                try:
+                    e.close()
+                except Exception:
+                    pass
 
     n_saved = n_collision + (n_complete if args.save_complete else 0)
     print("\n========== collect_crash_data 결과 ==========", flush=True)

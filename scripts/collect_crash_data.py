@@ -185,6 +185,14 @@ def main():
                     help="rollout 시도 횟수(충돌 ep만 저장되므로 실제 저장수 ≤ 이 값)")
     ap.add_argument("--out", required=True,
                     help="충돌 npz 저장 디렉터리(mkdir -p). tier별 분리 권장.")
+    ap.add_argument("--save-complete", action="store_true", default=False,
+                    help="저속 tier(cap-5/10) 전용: collision뿐 아니라 lap_complete ep도 저장. "
+                         "미지정(기본 False)=기존 충돌-only 동작 100% 불변. "
+                         "diverged/reverse/timeout/None은 여전히 폐기.")
+    ap.add_argument("--max-env-steps", type=int, default=None,
+                    help="지정 시 build_config 후 config.time_limit 오버라이드(env-step 단위). "
+                         "배회 ep 조기 truncate용. 미지정(기본 None)=config.time_limit 유지. "
+                         "완주 ep가 안 끊기게 cap-5/10은 9000 권장(=180s @action_repeat).")
     args = ap.parse_args()
 
     ckpt_path = pathlib.Path(args.ckpt)
@@ -203,11 +211,15 @@ def main():
     config.eval_state_mean = False          # latent stochastic (_policy L96 분기 skip)
     config.v_max = args.v_max               # action space high (load_agent의 make_env 전 확정 필수)
     config.device = "cpu"                    # 학습 GPU 무경쟁, 4 tier 동시
+    if args.max_env_steps is not None:      # 배회 ep 조기 truncate(완주 ep는 안 끊기게 9000 권장)
+        config.time_limit = args.max_env_steps  # make_env 전 확정 필수(TimeLimit 래퍼가 읽음)
 
     print(f"[collect] task={args.task} ckpt={ckpt_path} v_max={args.v_max} "
           f"episodes={args.episodes} out={out_dir}", flush=True)
     print(f"[collect] eval_state_mean={config.eval_state_mean} device={config.device} "
           f"(stochastic latent+action)", flush=True)
+    print(f"[collect] save_complete={args.save_complete} "
+          f"max_env_steps={args.max_env_steps} time_limit={config.time_limit}", flush=True)
 
     import tools
     agent, env = load_agent(config, ckpt_path)  # 내부 make_env → config.num_actions 세팅
@@ -237,11 +249,16 @@ def main():
                 saved = True
             elif cause == "lap_complete":
                 n_complete += 1
+                # --save-complete 시 완주 ep도 저장(저속 tier=느린완주라 BC위험 없음 + 다양성).
+                # 미지정 시 기존대로 폐기(동작 불변).
+                if args.save_complete:
+                    tools.save_episodes(out_dir, {ep_id: cache[ep_id]})  # {ep_id}-{length}.npz
+                    saved = True
             else:
                 key = str(cause)
                 n_other[key] = n_other.get(key, 0) + 1
             print(f"[collect] ep {i + 1}/{args.episodes}: cause={cause} len={length} "
-                  f"saved={saved} (collision={n_collision})", flush=True)
+                  f"saved={saved} (collision={n_collision} complete={n_complete})", flush=True)
             del cache  # ep마다 새 cache → 메모리 누수 방지
     finally:
         try:
@@ -249,12 +266,16 @@ def main():
         except Exception:
             pass
 
+    n_saved = n_collision + (n_complete if args.save_complete else 0)
     print("\n========== collect_crash_data 결과 ==========", flush=True)
     print(f"시도 ep        : {args.episodes}", flush=True)
+    print(f"save_complete  : {args.save_complete}  (max_env_steps={args.max_env_steps})", flush=True)
     print(f"충돌 저장      : {n_collision}  → {out_dir}", flush=True)
-    print(f"완주 폐기      : {n_complete}", flush=True)
+    print(f"완주 {'저장' if args.save_complete else '폐기'}      : {n_complete}"
+          f"{'  → ' + str(out_dir) if args.save_complete else ''}", flush=True)
+    print(f"총 저장        : {n_saved}", flush=True)
     print(f"기타 폐기      : {n_other}", flush=True)
-    print(f"수집률(충돌)   : {n_collision / args.episodes:.3f}" if args.episodes else "-",
+    print(f"수집률(저장)   : {n_saved / args.episodes:.3f}" if args.episodes else "-",
           flush=True)
     print("=============================================\n", flush=True)
 
